@@ -1,0 +1,22 @@
+goos: linux
+goarch: amd64
+pkg: github.com/yourname/fg/bigram
+cpu: INTEL(R) XEON(R) PLATINUM 8582C
+BenchmarkBigram_Build-2        	     382	   2926377 ns/op	 4143508 B/op	    1614 allocs/op
+BenchmarkBigram_Candidates-2   	    1226	    992066 ns/op	   41120 B/op	       4 allocs/op
+PASS
+ok  	github.com/yourname/fg/bigram	2.775s
+goos: linux
+goarch: amd64
+pkg: github.com/yourname/fg/grep
+cpu: INTEL(R) XEON(R) PLATINUM 8582C
+BenchmarkGrep_Search-2   	     216	   5218101 ns/op	  491398 B/op	    1173 allocs/op
+PASS
+ok  	github.com/yourname/fg/grep	1.770s
+goos: linux
+goarch: amd64
+pkg: github.com/yourname/fg/picker
+cpu: INTEL(R) XEON(R) PLATINUM 8582C
+BenchmarkPicker_Scan-2   	    1417	    915350 ns/op	  262520 B/op	   10009 allocs/op
+PASS
+ok  	github.com/yourname/fg/picker	6.697s

@@ -1,0 +1,26 @@
+# 构建产物
+fg
+fg.exe
+*.out
+
+# 测试/调试
+*.test
+*.prof
+*.pprof
+
+# 本地数据库（bbolt）
+*.db
+*.bolt
+
+# 覆盖率原始文件（太大）
+*.coverprofile
+coverage.out
+
+# IDE / OS
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Go 工具链缓存
+vendor/

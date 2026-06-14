@@ -1,0 +1,10 @@
+	github.com/yourname/fg		coverage: 0.0% of statements
+ok  	github.com/yourname/fg/bigram	56.199s	coverage: 88.1% of statements
+	github.com/yourname/fg/cmd/fg		coverage: 0.0% of statements
+ok  	github.com/yourname/fg/core	0.007s	coverage: 96.6% of statements
+ok  	github.com/yourname/fg/frecency	0.013s	coverage: 84.7% of statements
+ok  	github.com/yourname/fg/grep	0.149s	coverage: 89.2% of statements
+ok  	github.com/yourname/fg/kv	0.298s	coverage: 88.2% of statements
+ok  	github.com/yourname/fg/picker	3.390s	coverage: 67.8% of statements
+ok  	github.com/yourname/fg/queryparser	0.038s	coverage: 80.4% of statements
+ok  	github.com/yourname/fg/querytracker	0.015s	coverage: 93.0% of statements

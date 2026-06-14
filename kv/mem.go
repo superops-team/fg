@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"sort"
 	"sync"
 )
@@ -43,24 +44,19 @@ func (s *MemStore) Get(key string) ([]byte, bool, error) {
 // ForEach 按字典序遍历 prefix 匹配的 key；fn 返回 false 停止。
 func (s *MemStore) ForEach(prefix string, fn func(key string, value []byte) bool) error {
 	s.mu.RLock()
-	keys := make([]string, 0, len(s.m))
-	for k := range s.m {
+	entries := make([]struct{ k, v []byte }, 0, len(s.m))
+	for k, v := range s.m {
 		if len(prefix) == 0 || (len(k) >= len(prefix) && k[:len(prefix)] == prefix) {
-			keys = append(keys, k)
+			cp := make([]byte, len(v))
+			copy(cp, v)
+			entries = append(entries, struct{ k, v []byte }{[]byte(k), cp})
 		}
 	}
 	s.mu.RUnlock()
-	sort.Strings(keys)
-	for _, k := range keys {
-		// 再次加锁读，避免外部写入同时遍历，但因我们传值拷贝，语义正确
-		v, ok, err := s.Get(k)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if !fn(k, v) {
+	// 排序（字典序即字节序）
+	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].k, entries[j].k) < 0 })
+	for _, e := range entries {
+		if !fn(string(e.k), e.v) {
 			break
 		}
 	}

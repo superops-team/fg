@@ -169,16 +169,16 @@ func (q *QueryTracker) TopCombosForQuery(query string, topN int) []string {
 func (q *QueryTracker) ForEach(fn func(query, path string, count uint32) bool) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.store.ForEach(comboPrefix, func(k string, v []byte) bool {
-		rest := strings.TrimPrefix(k, comboPrefix)
+	return q.store.ForEach(comboPrefix, func(kvKey string, val []byte) bool {
+		rest := strings.TrimPrefix(kvKey, comboPrefix)
 		sep := strings.Index(rest, "\x00")
 		if sep < 0 {
 			return true
 		}
 		query, path := rest[:sep], rest[sep+1:]
 		var c uint32
-		if len(v) == 4 {
-			c = binary.LittleEndian.Uint32(v)
+		if len(val) == 4 {
+			c = binary.LittleEndian.Uint32(val)
 		}
 		return fn(query, path, c)
 	})

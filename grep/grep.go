@@ -8,7 +8,6 @@ package grep
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"os"
 	"strings"
@@ -232,6 +231,3 @@ func findCaseInsensitive(line, tok string) int {
 	idx := strings.Index(lowerLine, lowerTok)
 	return idx
 }
-
-// 确保 bytes 导入了
-var _ = bytes.TrimSpace

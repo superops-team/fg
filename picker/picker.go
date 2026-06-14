@@ -31,25 +31,23 @@ type Options struct {
 
 // Picker 是一个扫描 + 搜索 + 排名的控制器
 type Picker struct {
-	root       string
-	opts       Options
+	root   string
+	opts   Options
 
-	arena      *core.PathArena
-	files      []core.FileItem
-	fileMu     sync.RWMutex          // 保护 files/dirs 的并发访问（Scan 期间写入）
-	dirs       []core.DirItem
+	arena  *core.PathArena
+	files  []core.FileItem
+	fileMu sync.RWMutex // 保护 files 的并发访问（Scan 期间写入）
 
-	bg         *bigram.Bigram
-	overlay    *bigram.BigramOverlay
+	bg      *bigram.Bigram
+	overlay *bigram.BigramOverlay
 
-	frec       *frecency.FrecencyTracker
-	qt         *querytracker.QueryTracker
+	frec *frecency.FrecencyTracker
+	qt   *querytracker.QueryTracker
 
-	nowFn      func() time.Time
-	scanned    atomic.Bool           // Scan 完成标志
+	nowFn   func() time.Time
+	scanned atomic.Bool // Scan 完成标志
 
-	// 静态 buffer 池
-	pagePool   *core.PagePool
+	pagePool *core.PagePool
 }
 
 // Result 表示单条搜索结果
@@ -70,7 +68,6 @@ func New(root string, opts Options) *Picker {
 		opts:     opts,
 		arena:    core.NewPathArena(4096),
 		files:    make([]core.FileItem, 0, 4096),
-		dirs:     make([]core.DirItem, 0, 64),
 		bg:       bigram.NewBigram(),
 		overlay:  bigram.NewOverlay(),
 		frec:     frecency.New(frecency.Options{Mode: opts.FrecencyMode, NowFunc: nowFn}),
@@ -145,15 +142,14 @@ func (p *Picker) Scan() error {
 	p.arena = core.NewPathArena(4096)
 	p.fileMu.Lock()
 	p.files = p.files[:0]
-	p.dirs = p.dirs[:0]
 	p.fileMu.Unlock()
 
 	// 收集相对路径
 	var relPaths []string
 
-	err := filepath.WalkDir(p.root, func(full string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	err := filepath.WalkDir(p.root, func(full string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		rel, relErr := filepath.Rel(p.root, full)
 		if relErr != nil {
@@ -167,11 +163,6 @@ func (p *Picker) Scan() error {
 					return filepath.SkipDir
 				}
 			}
-			// 目录也加入 dirs
-			p.fileMu.Lock()
-			di := core.DirItem{Path: p.arena.Intern(rel), MaxAccessFrecency: 0}
-			p.dirs = append(p.dirs, di)
-			p.fileMu.Unlock()
 			return nil
 		}
 		if !d.Type().IsRegular() {
@@ -389,15 +380,15 @@ func (p *Picker) Search(query string, limit int) ([]Result, error) {
 
 // Result 的只读访问器
 func (r Result) Path() string {
-	if r.p == nil || int(r.idx) >= r.p.FileCount() {
+	if r.p == nil {
 		return ""
 	}
-	rel := ""
 	r.p.fileMu.RLock()
-	if int(r.idx) < len(r.p.files) {
-		rel = r.p.arena.Get(r.p.files[r.idx].Path)
+	defer r.p.fileMu.RUnlock()
+	if int(r.idx) >= len(r.p.files) {
+		return ""
 	}
-	r.p.fileMu.RUnlock()
+	rel := r.p.arena.Get(r.p.files[r.idx].Path)
 	return filepath.Join(r.p.root, rel)
 }
 
@@ -486,7 +477,13 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint) bool {
 			return size >= c.SizeBytes
 		case queryparser.SizeLte:
 			return size <= c.SizeBytes
+		default:
+			return true
 		}
+	case queryparser.CGitStatus:
+		// GitStatusPtr 目前 Scan() 始终为 nil，故 git 探测尚未实现；
+		// 暂按不生效处理（返回 true），后续接入 git status 探测后完善此分支。
+		return true
 	case queryparser.CModifiedAgo:
 		// modified:7d —— 文件在 7 天内被修改
 		secs, ok := parseDur(c.Value)
@@ -538,17 +535,12 @@ func matchGlob(pattern, path string) bool {
 		// 去掉 part 可能的开头 /
 		part = strings.TrimLeft(part, "/")
 		if i == 0 {
-			// 开头片段：必须匹配 path 的前缀（到下一个 /）
-			// 用 '/' 分割检查第一段是否匹配
+			// 开头片段：必须匹配 path 的前缀
 			pathParts := strings.SplitN(lowerPath[pos:], "/", 2)
-			// 第一段可能含多个组件；先尝试整个剩余路径匹配 part
-			// 简化：从 pos 开始在 path 中找 part 的匹配
 			ok, _ := filepath.Match(part, pathParts[0])
 			if !ok {
-				// 第一段也可能是带 / 的复合模式，尝试 "part/x" 更长
-				// 简化：如果 part 不是路径，直接尝试在 path 尾部找
+				// part 是复合路径模式（如 "pkg/src"），需要多段联合匹配
 				if strings.Contains(part, "/") {
-					// 前缀多段匹配：取前 N 个组件
 					segCount := strings.Count(part, "/") + 1
 					pathSegs := strings.SplitN(lowerPath[pos:], "/", segCount+1)
 					if len(pathSegs) < segCount {
@@ -559,17 +551,19 @@ func matchGlob(pattern, path string) bool {
 					if !ok {
 						return false
 					}
-					pos += len(joined) + 1
-					if pos > len(lowerPath) {
-						pos = len(lowerPath)
+					// 精确移动 pos（若 pos 已在末尾则不越界）
+					pos += len(joined)
+					if pos < len(lowerPath) && lowerPath[pos] == '/' {
+						pos++
 					}
 					continue
 				}
 				return false
 			}
-			pos += len(pathParts[0]) + 1
-			if pos > len(lowerPath) {
-				pos = len(lowerPath)
+			// 移动 pos
+			pos += len(pathParts[0])
+			if pos < len(lowerPath) && lowerPath[pos] == '/' {
+				pos++
 			}
 			continue
 		}
@@ -608,7 +602,6 @@ func matchGlob(pattern, path string) bool {
 			return matched
 		}
 		// 中间片段：必须在剩余 path 中某位置匹配
-		// 简化：跳过到下一个匹配点
 		remainder := lowerPath[pos:]
 		partSegs := strings.Split(part, "/")
 		remSegs := strings.Split(remainder, "/")
@@ -626,11 +619,17 @@ func matchGlob(pattern, path string) bool {
 				}
 			}
 			if ok {
-				// 找到：移动 pos
-				joined := strings.Join(remSegs[:startIdx+len(partSegs)], "/")
-				pos += len(joined) + 1
-				if pos > len(lowerPath) {
-					pos = len(lowerPath)
+				// 找到：移动 pos 到该段之后（含分隔符）
+				consumed := 0
+				for k := 0; k < startIdx+len(partSegs); k++ {
+					consumed += len(remSegs[k])
+					if k < startIdx+len(partSegs)-1 {
+						consumed++ // 每个段后的 '/'
+					}
+				}
+				pos += consumed
+				if pos < len(lowerPath) && lowerPath[pos] == '/' {
+					pos++
 				}
 				found = true
 				break

@@ -45,31 +45,37 @@ func (a *PathArena) Intern(path string) ChunkedPath {
 }
 
 // Get 返回 ChunkedPath 对应原始 path 字符串。
-// 读路径无锁（strings slice 只在 Intern 下 append，且底层数组扩容后旧引用仍有效；
-// 但这里读 strings 长度/元素是非原子的，为安全起见仍需细粒度 —— 由于 arena 只追加，
-// 元素一旦写入即可读，关键约束: **调用方**需确保底层 strings slice 不会被并发修改为更小长度。
-// Intern 只追加，故 Get 只需持 RWMutex-style: 此处简化为不加锁 —— 如果上层 search 与 Intern
-// 并发，上层应该用自己的 RWMutex 保证同一时刻没有 write+read。
-// 为简单起见，也不在此函数做任何同步，让调用方负责。
+// 若索引越界（Arena 已重置或 ChunkedPath 来自不同 Arena），返回空串。
 func (a *PathArena) Get(cp ChunkedPath) string {
 	a.mu.RLock()
-	s := a.strings[cp.Index]
-	a.mu.RUnlock()
-	return s
+	defer a.mu.RUnlock()
+	if cp.Index >= uint32(len(a.strings)) {
+		return ""
+	}
+	return a.strings[cp.Index]
 }
 
 func (a *PathArena) Filename(cp ChunkedPath) string {
 	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if cp.Index >= uint32(len(a.strings)) {
+		return ""
+	}
 	s := a.strings[cp.Index]
-	a.mu.RUnlock()
+	if cp.FilenameOffset >= uint32(len(s)) {
+		return ""
+	}
 	return s[cp.FilenameOffset:]
 }
 
 func (a *PathArena) Dir(cp ChunkedPath) string {
 	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if cp.Index >= uint32(len(a.strings)) {
+		return ""
+	}
 	s := a.strings[cp.Index]
-	a.mu.RUnlock()
-	if cp.FilenameOffset == 0 {
+	if cp.FilenameOffset == 0 || cp.FilenameOffset > uint32(len(s)) {
 		return ""
 	}
 	return s[:cp.FilenameOffset-1]

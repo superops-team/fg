@@ -9,9 +9,11 @@ package grep
 import (
 	"bufio"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/yourname/fg/core"
 )
@@ -78,7 +80,7 @@ func (g *GrepMatcher) SearchFile(path, query string, limit int) ([]LineResult, e
 	headBuf := g.pool.Get()
 	n, _ := f.Read(*headBuf)
 	// 重置位置
-	_, _ = f.Seek(0, 0)
+	_, _ = f.Seek(0, io.SeekStart)
 	isBinary := core.DetectBinaryContent((*headBuf)[:n])
 	g.pool.Put(headBuf)
 	if isBinary && !g.opts.IncludeBinary {
@@ -213,21 +215,34 @@ func isAllLower(s string) bool {
 	return true
 }
 
-// findCaseInsensitive 在 line 里找 tok 的首次出现位置（不区分大小写）
+// findCaseInsensitive 在 line 中查找 tok 的首次出现位置（不区分大小写）。
+// 返回 line 中的字节偏移。使用 rune 边界扫描，确保非 ASCII 内容的偏移也正确。
 func findCaseInsensitive(line, tok string) int {
-	if tok == "" {
+	if tok == "" || len(line) < len(tok) {
 		return -1
 	}
-	if len(line) < len(tok) {
-		return -1
+	// 快速路径：精确子串匹配
+	if idx := strings.Index(line, tok); idx >= 0 {
+		return idx
 	}
-	// 快速路径：如果 line 就是小写
-	if strings.Contains(line, tok) {
-		return strings.Index(line, tok)
-	}
-	// 否则逐字符小写比较
 	lowerTok := strings.ToLower(tok)
-	lowerLine := strings.ToLower(line)
-	idx := strings.Index(lowerLine, lowerTok)
-	return idx
+	// 在 line 的每个 rune 起点检查小写前缀是否匹配
+	for i := 0; i <= len(line)-len(tok); {
+		rest := line[i:]
+		// 取 rest 前 len(tok) 字节做小写化比较
+		checkLen := len(tok)
+		if checkLen > len(rest) {
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(rest[:checkLen]), lowerTok) {
+			return i
+		}
+		// 按 rune 步进
+		_, size := utf8.DecodeRuneInString(rest)
+		if size <= 0 {
+			size = 1
+		}
+		i += size
+	}
+	return -1
 }

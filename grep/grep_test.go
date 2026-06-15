@@ -231,3 +231,98 @@ func TestGrep_FuzzyTokens(t *testing.T) {
 		t.Fatalf("fuzzy 'foo bar' 应命中 1 行， got %d", len(results))
 	}
 }
+
+// ================================================================
+// 11. 回归: Unicode 大小写不敏感匹配 & 字节位置正确
+//     Bug: 原 findCaseInsensitive 用 strings.ToLower(line) 比较后返回
+//     Index 位置，但对非 ASCII 文本，字节位置会错位。
+// ================================================================
+
+func TestGrep_CaseInsensitiveUnicode(t *testing.T) {
+	dir := t.TempDir()
+	// 包含 CJK 字符 + 英文大小写
+	content := "行号 hello world\n第 2 行 HELLO 中文\nline 3 Café\n"
+	fp := writeTestFile(t, dir, "unicode.txt", content)
+
+	// 测试 1: 小写查询应找到大写 HELLO
+	m := New(Options{})
+	results, err := m.SearchFile(fp, "hello", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("hello 应命中 2 行， got %d", len(results))
+	}
+
+	// 测试 2: 大小写敏感不应命中
+	m2 := New(Options{CaseInsensitive: false})
+	results2, err := m2.SearchFile(fp, "HELLO", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results2) != 1 {
+		t.Fatalf("HELLO 大小写敏感应命中 1 行， got %d", len(results2))
+	}
+
+	// 测试 3: Unicode 字符的匹配 —— Café 应能被 café 命中（不敏感）
+	results3, err := m.SearchFile(fp, "café", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results3) != 1 {
+		t.Fatalf("café 应命中 1 行（Unicode 小写化）， got %d", len(results3))
+	}
+
+	// 测试 4: 匹配位置的字节范围必须合理
+	results4, err := m.SearchFile(fp, "world", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results4) != 1 {
+		t.Fatalf("world 应命中 1 行， got %d", len(results4))
+	}
+	// MatchRange.Start 必须小于 line 的长度（防止 Unicode 错位导致越界）
+	if results4[0].Matches[0].Start >= len(results4[0].Text) {
+		t.Fatalf("MatchRange.Start (%d) 超出 line 长度 (%d)，位置错位",
+			results4[0].Matches[0].Start, len(results4[0].Text))
+	}
+}
+
+func TestGrep_UnicodeMultiTokenCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	content := "CAFÉ world\ncafé hello\nrandom\n"
+	fp := writeTestFile(t, dir, "u2.txt", content)
+
+	m := New(Options{})
+	results, err := m.SearchFile(fp, "café hello", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 多 token 大小写不敏感：所有 token 都在同一行
+	if len(results) < 1 {
+		t.Fatalf("café hello 应至少命中 1 行， got %d", len(results))
+	}
+}
+
+// ================================================================
+// 12. 回归: io.SeekStart 替代魔数 0（文件遍历后重置位置）
+//     通过 large file 的 binary 检测间接覆盖：large 测试已
+//     走 fp.Read + 路径重置逻辑。此处确保小文件 + 小查询不 panic。
+// ================================================================
+
+func TestGrep_SmallFileBinaryDetection(t *testing.T) {
+	dir := t.TempDir()
+	// 小文件纯文本 + 再搜索 —— 覆盖 Read -> SeekStart 路径
+	fp := writeTestFile(t, dir, "small.txt", "hello world\n")
+	m := New(Options{})
+	// 搜索两次，确保 Seek 后第二次搜索正确
+	for i := 0; i < 2; i++ {
+		results, err := m.SearchFile(fp, "hello", 5)
+		if err != nil {
+			t.Fatalf("第 %d 次搜索失败: %v", i+1, err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("第 %d 次搜索应命中 1 行， got %d", i+1, len(results))
+		}
+	}
+}

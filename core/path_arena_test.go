@@ -168,3 +168,64 @@ func TestFileItem_WithPathArena_Integration(t *testing.T) {
 		}
 	}
 }
+
+// ========================================
+// 回归: PathArena 越界访问保护
+// ----------------------------------------
+// Bug: 原始实现 a.strings[idx] / s[cp.FilenameOffset:] 在构造假 ChunkedPath
+// 时会越界 panic。修复后应安全返回空串。
+// ========================================
+
+func TestPathArena_Get_OutOfRangeIndex(t *testing.T) {
+	a := NewPathArena(4)
+	_ = a.Intern("a.go")
+	bad := ChunkedPath{Index: 99, FilenameOffset: 0}
+	if got := a.Get(bad); got != "" {
+		t.Fatalf("越界 index 应返回空串， got %q", got)
+	}
+}
+
+func TestPathArena_Filename_OutOfRangeIndex(t *testing.T) {
+	a := NewPathArena(4)
+	_ = a.Intern("a.go")
+	bad := ChunkedPath{Index: 1234, FilenameOffset: 0}
+	if got := a.Filename(bad); got != "" {
+		t.Fatalf("越界 Filename 应返回空串， got %q", got)
+	}
+}
+
+func TestPathArena_Filename_OutOfRangeOffset(t *testing.T) {
+	a := NewPathArena(4)
+	cp := a.Intern("a.go")
+	bad := ChunkedPath{Index: cp.Index, FilenameOffset: 999}
+	if got := a.Filename(bad); got != "" {
+		t.Fatalf("offset 越界应返回空串， got %q", got)
+	}
+}
+
+func TestPathArena_Dir_OutOfRangeIndex(t *testing.T) {
+	a := NewPathArena(4)
+	_ = a.Intern("a.go")
+	bad := ChunkedPath{Index: 42, FilenameOffset: 0}
+	if got := a.Dir(bad); got != "" {
+		t.Fatalf("Dir 越界 index 应返回空串， got %q", got)
+	}
+}
+
+func TestPathArena_Dir_OutOfRangeOffset(t *testing.T) {
+	a := NewPathArena(4)
+	cp := a.Intern("foo/bar.go")
+	bad := ChunkedPath{Index: cp.Index, FilenameOffset: 9999}
+	if got := a.Dir(bad); got != "" {
+		t.Fatalf("Dir 超界 offset 应返回空串， got %q", got)
+	}
+}
+
+func TestPathArena_Dir_NoSlashStillWorks(t *testing.T) {
+	a := NewPathArena(4)
+	cp := a.Intern("src/util/main.go")
+	dir := a.Dir(cp)
+	if dir != "src/util" {
+		t.Fatalf("Dir=%q, want src/util", dir)
+	}
+}

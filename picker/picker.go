@@ -292,7 +292,7 @@ func (p *Picker) Search(query string, limit int) ([]Result, error) {
 
 		// 应用约束过滤（extension/type/size/modified/glob/pathsegment/not）
 		relPath := p.arena.Get(f.Path)
-		if !matchesConstraints(relPath, f, parsed.Constraints) {
+		if !matchesConstraints(relPath, f, parsed.Constraints, p.nowFn) {
 			continue
 		}
 
@@ -430,22 +430,22 @@ func normalizeFuzzy(fq queryparser.FuzzyQuery) string {
 }
 
 // matchesConstraints 检查文件是否匹配所有约束（AND 语义）
-func matchesConstraints(relPath string, f *core.FileItem, constraints []queryparser.Constraint) bool {
+func matchesConstraints(relPath string, f *core.FileItem, constraints []queryparser.Constraint, nowFn func() time.Time) bool {
 	for _, c := range constraints {
-		if !matchOne(relPath, f, c) {
+		if !matchOne(relPath, f, c, nowFn) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint) bool {
+func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn func() time.Time) bool {
 	switch c.Kind {
 	case queryparser.CNot:
 		if c.Child == nil {
 			return true
 		}
-		return !matchOne(relPath, f, *c.Child)
+		return !matchOne(relPath, f, *c.Child, nowFn)
 	case queryparser.CExtension:
 		// *.go -> 检查 ext
 		ext := strings.ToLower(filepath.Ext(relPath))
@@ -485,12 +485,16 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint) bool {
 		// 暂按不生效处理（返回 true），后续接入 git status 探测后完善此分支。
 		return true
 	case queryparser.CModifiedAgo:
-		// modified:7d —— 文件在 7 天内被修改
 		secs, ok := parseDur(c.Value)
 		if !ok {
 			return true
 		}
-		now := time.Now().Unix()
+		var now int64
+		if nowFn != nil {
+			now = nowFn().Unix()
+		} else {
+			now = time.Now().Unix()
+		}
 		return int64(f.Modified) >= now-secs && int64(f.Modified) <= now
 	case queryparser.CPathSegment:
 		// 在路径前后加上前导斜杠，确保匹配任意位置
@@ -640,13 +644,6 @@ func matchGlob(pattern, path string) bool {
 		}
 	}
 	return true
-}
-
-func splitComponents(s string) []string {
-	if s == "" {
-		return nil
-	}
-	return strings.Split(s, "/")
 }
 
 // parseDur 解析 "7d" / "24h" 为秒

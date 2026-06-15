@@ -299,3 +299,92 @@ func TestPicker_WithInjectedClock(t *testing.T) {
 		}
 	}
 }
+
+// ================================================================
+// 11. 回归: CModifiedAgo 使用注入时间而非系统时间
+//     验证 modified:7d 约束在注入时间下返回一致结果
+// ================================================================
+
+func TestPicker_ModifiedAgo_UsesInjectedClock(t *testing.T) {
+	dir := t.TempDir()
+	// 3 个文件:
+	//   old.txt -> 位于 [now-365d]
+	//   recent.txt -> [now-3d]
+	//   fresh.txt -> [now-1h]
+	now := time.Date(2025, 3, 1, 10, 0, 0, 0, time.UTC)
+	files := []struct {
+		name    string
+		modTime time.Time
+	}{
+		{"old.txt", now.AddDate(-1, 0, 0)},   // 1 年前
+		{"recent.txt", now.AddDate(0, 0, -3)}, // 3 天前
+		{"fresh.txt", now.Add(-1 * time.Hour)}, // 1 小时前
+	}
+	for _, f := range files {
+		fp := filepath.Join(dir, f.name)
+		if err := os.WriteFile(fp, []byte("contents"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(fp, f.modTime, f.modTime); err != nil {
+			t.Fatalf("Chtimes 失败: %v", err)
+		}
+	}
+
+	p := New(dir, Options{
+		NowFunc: func() time.Time { return now },
+	})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	// modified:7d -> 应包含 recent.txt 和 fresh.txt，不含 old.txt
+	results, err := p.Search("modified:7d", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 构建结果集，检查文件名
+	hasOld, hasRecent, hasFresh := false, false, false
+	for _, r := range results {
+		name := filepath.Base(r.Path())
+		switch name {
+		case "old.txt":
+			hasOld = true
+		case "recent.txt":
+			hasRecent = true
+		case "fresh.txt":
+			hasFresh = true
+		}
+	}
+	if !hasRecent {
+		t.Error("recent.txt 应命中 modified:7d 约束，但未找到")
+	}
+	if !hasFresh {
+		t.Error("fresh.txt 应命中 modified:7d 约束，但未找到")
+	}
+	if hasOld {
+		t.Error("old.txt 不应命中 modified:7d，但被返回")
+	}
+}
+
+// ================================================================
+// 12. 回归: CModifiedAgo 使用系统时间 (无注入) 不 panic
+// ================================================================
+
+func TestPicker_ModifiedAgo_NoPanic(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(fp, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := New(dir, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	results, err := p.Search("modified:365d", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = results // 只要不 panic 即可
+}

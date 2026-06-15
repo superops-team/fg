@@ -34,8 +34,8 @@ func runStoreTests(t *testing.T, name string, factory func() (KVStore, func(), e
 			t.Fatal(err)
 		}
 		v, ok, _ = store.Get("foo")
-		if string(v) != "baz" {
-			t.Fatalf("覆盖写入后应返回 baz， got %q", v)
+		if !ok || string(v) != "baz" {
+			t.Fatalf("覆盖写入后应返回 baz， got (%q,%v)", v, ok)
 		}
 		// 删除
 		if err := store.Put("foo", nil); err != nil {
@@ -190,5 +190,70 @@ func TestBoltStore_Persistence(t *testing.T) {
 	v, ok, err := s2.Get("key1")
 	if err != nil || !ok || string(v) != "v1" {
 		t.Fatalf("重新打开后应读到 v1， got (%q,%v,%v)", v, ok, err)
+	}
+}
+
+// ================================================================
+// 回归: Overwrite 后 ok 必须为 true 且 value 被更新
+//     Bug: 原实现中 ok 变量声明后未检查，导致覆盖写入的
+//     ok 状态未验证。确保覆盖写入后 ok 为 true。
+// ================================================================
+
+func TestKV_OverwriteReturnsOk(t *testing.T) {
+	stores := []struct {
+		name    string
+		factory func() (KVStore, func(), error)
+	}{
+		{"Mem", func() (KVStore, func(), error) {
+			s := NewMemStore()
+			return s, func() { _ = s.Close() }, nil
+		}},
+	}
+	if !testing.Short() {
+		stores = append(stores, struct {
+			name    string
+			factory func() (KVStore, func(), error)
+		}{
+			"Bolt", func() (KVStore, func(), error) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "overwrite.db")
+				s, err := OpenBoltStore(path, "test", DefaultOptions())
+				if err != nil {
+					return nil, func() {}, err
+				}
+				return s, func() { _ = s.Close() }, nil
+			},
+		})
+	}
+
+	for _, st := range stores {
+		t.Run(st.name, func(t *testing.T) {
+			store, cleanup, err := st.factory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			if err := store.Put("k", []byte("v1")); err != nil {
+				t.Fatalf("第一次 Put 失败: %v", err)
+			}
+			v, ok, err := store.Get("k")
+			if err != nil || !ok || string(v) != "v1" {
+				t.Fatalf("Get 1: (%q,%v,%v)", v, ok, err)
+			}
+			if err := store.Put("k", []byte("v2")); err != nil {
+				t.Fatalf("第二次 Put 失败: %v", err)
+			}
+			v, ok, err = store.Get("k")
+			if err != nil {
+				t.Fatalf("覆盖后 Get 错误: %v", err)
+			}
+			if !ok {
+				t.Fatal("覆盖后 ok 应为 true")
+			}
+			if string(v) != "v2" {
+				t.Fatalf("覆盖后 value 应为 v2, got %q", v)
+			}
+		})
 	}
 }

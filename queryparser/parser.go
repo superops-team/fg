@@ -3,14 +3,10 @@ package queryparser
 import "strings"
 
 // QueryParser 解析器。目前无状态；保留 struct 以便未来添加配置。
-type QueryParser struct {
-	cfg ParserConfig
-}
+type QueryParser struct{}
 
 // ParserConfig 预留扩展点。
-type ParserConfig struct {
-	// （预留给未来：自定义 key-val 处理器、自定义 glob 模式、禁用取反等）
-}
+type ParserConfig struct{}
 
 // New 返回一个默认 Parser。
 func New() *QueryParser { return &QueryParser{} }

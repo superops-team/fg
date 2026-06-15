@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // helper: 写测试文件
@@ -191,6 +192,29 @@ func TestGrep_ManyConcurrent(t *testing.T) {
 	}
 }
 
+func TestGrep_SearchManyPreservesInputOrder(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		writeTestFile(t, dir, "a.txt", "needle a\n"),
+		writeTestFile(t, dir, "b.txt", "needle b\n"),
+		writeTestFile(t, dir, "c.txt", "needle c\n"),
+	}
+
+	m := New(Options{Concurrency: 3})
+	results, err := m.SearchMany(files, "needle", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(files) {
+		t.Fatalf("expected %d results, got %d", len(files), len(results))
+	}
+	for i, result := range results {
+		if result.Path != files[i] {
+			t.Fatalf("result %d should preserve input order path %q, got %q", i, files[i], result.Path)
+		}
+	}
+}
+
 func TestGrep_SearchManyReturnsMatchesAndJoinedErrors(t *testing.T) {
 	dir := t.TempDir()
 	good := writeTestFile(t, dir, "good.txt", "alpha needle\n")
@@ -350,5 +374,82 @@ func TestGrep_SmallFileBinaryDetection(t *testing.T) {
 		if len(results) != 1 {
 			t.Fatalf("第 %d 次搜索应命中 1 行， got %d", i+1, len(results))
 		}
+	}
+}
+
+func TestGrep_LongLineBeyondScannerDefaultStillMatches(t *testing.T) {
+	dir := t.TempDir()
+	longLine := strings.Repeat("x", 70*1024) + "needle\n"
+	fp := writeTestFile(t, dir, "long.txt", longLine)
+
+	m := New(Options{})
+	results, err := m.SearchFile(fp, "needle", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("long line should still be searched, got %d results", len(results))
+	}
+	if len(results[0].Matches) != 1 || results[0].Matches[0].Start != 70*1024 {
+		t.Fatalf("match range should point into original long line, got %+v", results[0].Matches)
+	}
+}
+
+func TestGrep_OverMaxLineStillSearchesPrefix(t *testing.T) {
+	dir := t.TempDir()
+	line := "needle" + strings.Repeat("x", 70*1024)
+	fp := writeTestFile(t, dir, "over-max-line.txt", line)
+
+	m := New(Options{MaxBytes: 64 * 1024})
+	results, err := m.SearchFile(fp, "needle", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("over-max line should still search the in-budget prefix, got %d results", len(results))
+	}
+	if len(results[0].Matches) != 1 || results[0].Matches[0].Start != 0 {
+		t.Fatalf("match range should point to prefix match, got %+v", results[0].Matches)
+	}
+}
+
+func TestGrep_CaseInsensitiveSingleTokenReturnsOriginalUnicodeByteRange(t *testing.T) {
+	dir := t.TempDir()
+	line := "ẞfoo"
+	fp := writeTestFile(t, dir, "unicode-range.txt", line+"\n")
+
+	m := New(Options{})
+	results, err := m.SearchFile(fp, "foo", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || len(results[0].Matches) != 1 {
+		t.Fatalf("expected one match, got %+v", results)
+	}
+	match := results[0].Matches[0]
+	if match.Start != len("ẞ") || match.End != len(line) {
+		t.Fatalf("match should use original byte offsets [%d,%d), got [%d,%d)", len("ẞ"), len(line), match.Start, match.End)
+	}
+	if !utf8.ValidString(results[0].Text[match.Start:match.End]) {
+		t.Fatalf("match range should not split unicode runes: %+v", match)
+	}
+}
+
+func TestGrep_CaseInsensitiveLowercaseExpansionReturnsOriginalUnicodeRange(t *testing.T) {
+	dir := t.TempDir()
+	line := "Ⱥ"
+	fp := writeTestFile(t, dir, "unicode-expansion.txt", line+"\n")
+
+	m := New(Options{})
+	results, err := m.SearchFile(fp, "ⱥ", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || len(results[0].Matches) != 1 {
+		t.Fatalf("expected one match, got %+v", results)
+	}
+	match := results[0].Matches[0]
+	if match.Start != 0 || match.End != len(line) {
+		t.Fatalf("match should use original byte offsets [0,%d), got [%d,%d)", len(line), match.Start, match.End)
 	}
 }

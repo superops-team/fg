@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/superops-team/fg/grep"
 )
 
 func writeCLITestFile(t *testing.T, root, name, content string) string {
@@ -90,6 +93,44 @@ func TestCLI_SearchThenGrepAcceptsGrepFlagAfterQuery(t *testing.T) {
 	}
 	if strings.Contains(stdout, "note.txt") {
 		t.Fatalf("grep with file query should not search non-matching files, got %q", stdout)
+	}
+}
+
+func TestCLI_QueryCanSpanMultiplePositionalArgs(t *testing.T) {
+	root := t.TempDir()
+	writeCLITestFile(t, root, "main.go", "package main\n")
+	writeCLITestFile(t, root, "helper.go", "package helper\n")
+
+	stdout, stderr, code := runCLIForTest("-r", root, "main", "type:go")
+	if code != 0 {
+		t.Fatalf("exit code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, "main.go") {
+		t.Fatalf("stdout should contain main.go, got %q", stdout)
+	}
+	if strings.Contains(stdout, "helper.go") {
+		t.Fatalf("multi-token query should filter to main.go, got %q", stdout)
+	}
+}
+
+func TestCLI_GrepPrintsPartialResultsBeforeJoinedError(t *testing.T) {
+	root := t.TempDir()
+	good := writeCLITestFile(t, root, "good.txt", "needle\n")
+	missing := filepath.Join(root, "missing.txt")
+
+	var stdout, stderr bytes.Buffer
+	code := printGrepResults(&stdout, &stderr, []grep.FileResult{
+		{Path: good, Lines: []grep.LineResult{{Lineno: 1, Text: "needle"}}},
+	}, errors.Join(os.ErrNotExist, errors.New(missing)), 10)
+
+	if code == 0 {
+		t.Fatal("expected non-zero exit code for partial grep error")
+	}
+	if !strings.Contains(stdout.String(), "good.txt:1:needle") {
+		t.Fatalf("stdout should include successful partial match, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), missing) || !strings.Contains(stderr.String(), "file does not exist") {
+		t.Fatalf("stderr should include joined error with missing path, got %q", stderr.String())
 	}
 }
 

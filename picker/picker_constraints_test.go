@@ -306,6 +306,21 @@ func TestPicker_UnknownStatusConstraintDoesNotRequireGit(t *testing.T) {
 	}
 }
 
+func TestPicker_NegatedUnknownStatusConstraintDoesNotFilterEverything(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "main.go", "package main\n")
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("!status:unknown", 10)
+	if err != nil {
+		t.Fatalf("未知 status 取反不应加载 git status 或返回错误: %v", err)
+	}
+	if len(res) != 1 || filepath.Base(res[0].Path()) != "main.go" {
+		t.Fatalf("未知 status 取反也应保持 no-op，got %+v", res)
+	}
+}
+
 func TestPicker_StatusConstraintHandlesPathWithSpaces(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -346,6 +361,85 @@ func TestPicker_StatusDeletedReturnsDeletedTrackedPath(t *testing.T) {
 	}
 	if len(res) != 1 || filepath.Base(res[0].Path()) != "deleted.go" {
 		t.Fatalf("status:deleted 应返回已删除 tracked path，got %+v", res)
+	}
+}
+
+func TestPicker_StatusDeletedVirtualResultDoesNotUseZeroMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "deleted.go", "package deleted\n")
+	runGit(t, root, "init")
+	runGit(t, root, "add", "deleted.go")
+	runGit(t, root, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init")
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("status:deleted <100B", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("virtual deleted result must not be matched using zero-value size metadata, got %+v", res)
+	}
+}
+
+func TestPicker_StatusUntrackedHandlesNestedFilesInUntrackedDirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "newdir/nested.go", "package nested\n")
+	runGit(t, root, "init")
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("status:untracked", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || filepath.ToSlash(res[0].Path()[len(root)+1:]) != "newdir/nested.go" {
+		t.Fatalf("status:untracked 应匹配未跟踪目录内的文件，got %+v", res)
+	}
+
+	clean, err := p.Search("status:clean", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clean) != 0 {
+		t.Fatalf("status:clean 不应包含未跟踪目录内的文件，got %+v", clean)
+	}
+}
+
+func TestPicker_StatusDeletedDoesNotDuplicateStaleScannedFile(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "deleted.go", "package deleted\n")
+	runGit(t, root, "init")
+	runGit(t, root, "add", "deleted.go")
+	runGit(t, root, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init")
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := p.Search("status:deleted", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || filepath.Base(res[0].Path()) != "deleted.go" {
+		t.Fatalf("status:deleted should return stale scanned file once, got %+v", res)
 	}
 }
 

@@ -397,9 +397,19 @@ func (p *Picker) scoreDeletedGitCandidates(plan searchPlan) []scoredResult {
 	if plan.gitStatuses == nil {
 		return nil
 	}
+	if !supportsVirtualDeletedConstraints(plan.parsed.Constraints) {
+		return nil
+	}
+	scannedPaths := make(map[string]struct{}, len(p.files))
+	for i := range p.files {
+		scannedPaths[filepath.ToSlash(p.arena.Get(p.files[i].Path))] = struct{}{}
+	}
 	var deleted []scoredResult
 	for relPath, status := range plan.gitStatuses {
 		if status != core.GitStatusDeleted {
+			continue
+		}
+		if _, ok := scannedPaths[filepath.ToSlash(relPath)]; ok {
 			continue
 		}
 		f := core.FileItem{}
@@ -520,6 +530,9 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn 
 		if c.Child == nil {
 			return true
 		}
+		if isNoopConstraint(*c.Child) {
+			return true
+		}
 		return !matchOne(relPath, f, *c.Child, nowFn, gitStatuses)
 	case queryparser.CExtension:
 		// *.go -> 检查 ext
@@ -556,6 +569,9 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn 
 			return true
 		}
 	case queryparser.CGitStatus:
+		if !isKnownGitStatusValue(c.Value) {
+			return true
+		}
 		return matchGitStatus(relPath, c.Value, gitStatuses)
 	case queryparser.CModifiedAgo:
 		secs, ok := parseDur(c.Value)
@@ -585,6 +601,42 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn 
 		return strings.Contains(strings.ToLower(relPath), strings.ToLower(c.Value))
 	}
 	return true // 未知类型：不滤
+}
+
+func isNoopConstraint(c queryparser.Constraint) bool {
+	switch c.Kind {
+	case queryparser.CGitStatus:
+		return !isKnownGitStatusValue(c.Value)
+	case queryparser.CFileType:
+		return len(queryparser.ExtensionFor(c.Value)) == 0
+	case queryparser.CModifiedAgo:
+		_, ok := parseDur(c.Value)
+		return !ok
+	}
+	return false
+}
+
+func supportsVirtualDeletedConstraints(constraints []queryparser.Constraint) bool {
+	for _, c := range constraints {
+		if !supportsVirtualDeletedConstraint(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func supportsVirtualDeletedConstraint(c queryparser.Constraint) bool {
+	switch c.Kind {
+	case queryparser.CNot:
+		if c.Child == nil {
+			return true
+		}
+		return supportsVirtualDeletedConstraint(*c.Child)
+	case queryparser.CSizeCmp, queryparser.CModifiedAgo:
+		return false
+	default:
+		return true
+	}
 }
 
 // matchGlob 支持 "**/*.go" / "src/**/*.rs" 这样的 glob。** 匹配任意层级目录。
@@ -684,7 +736,7 @@ func isKnownGitStatusValue(value string) bool {
 }
 
 func loadGitStatuses(root string) (map[string]core.GitStatusKind, error) {
-	cmd := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z")
+	cmd := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git status --porcelain failed in %q: %w: %s", root, err, strings.TrimSpace(string(out)))

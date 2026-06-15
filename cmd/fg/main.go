@@ -42,7 +42,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	query := ""
 	if len(rest) > 0 {
-		query = rest[0]
+		query = strings.Join(rest, " ")
 	}
 	if query == "" && cfg.grepText == "" {
 		printUsage(stderr)
@@ -146,19 +146,25 @@ func runGrep(cfg cliConfig, fileQuery string, stdout, stderr io.Writer) int {
 	}
 	matcher := grep.New(grep.Options{})
 	results, err := matcher.SearchMany(paths, cfg.grepText, cfg.limit)
+	return printGrepResults(stdout, stderr, results, err, cfg.limit)
+}
+
+func printGrepResults(stdout, stderr io.Writer, results []grep.FileResult, err error, limit int) int {
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		defer fmt.Fprintln(stderr, err)
 	}
 	printedFiles := 0
 	for _, fr := range results {
-		if printedFiles >= cfg.limit {
+		if printedFiles >= limit {
 			break
 		}
 		printedFiles++
 		for _, line := range fr.Lines {
 			fmt.Fprintf(stdout, "%s:%d:%s\n", fr.Path, line.Lineno, line.Text)
 		}
+	}
+	if err != nil {
+		return 1
 	}
 	return 0
 }

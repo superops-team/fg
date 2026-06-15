@@ -1,6 +1,6 @@
 # 构建产物
-fg
-fg.exe
+/fg
+/fg.exe
 *.out
 
 # 测试/调试

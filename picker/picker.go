@@ -2,7 +2,10 @@
 package picker
 
 import (
+	"bytes"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,11 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yourname/fg/bigram"
-	"github.com/yourname/fg/core"
-	"github.com/yourname/fg/frecency"
-	"github.com/yourname/fg/queryparser"
-	"github.com/yourname/fg/querytracker"
+	"github.com/superops-team/fg/bigram"
+	"github.com/superops-team/fg/core"
+	"github.com/superops-team/fg/frecency"
+	"github.com/superops-team/fg/queryparser"
+	"github.com/superops-team/fg/querytracker"
 )
 
 // Options 控制 Picker 的行为
@@ -31,8 +34,8 @@ type Options struct {
 
 // Picker 是一个扫描 + 搜索 + 排名的控制器
 type Picker struct {
-	root   string
-	opts   Options
+	root string
+	opts Options
 
 	arena  *core.PathArena
 	files  []core.FileItem
@@ -55,6 +58,7 @@ type Result struct {
 	idx   uint32
 	score int32
 	p     *Picker
+	path  string
 }
 
 // New 返回一个新的 Picker（使用默认内存 frecency/querytracker）。
@@ -234,53 +238,90 @@ func (p *Picker) Scan() error {
 // Search: fuzzy 模糊搜索 + bigram 预过滤 + 排序
 // ================================================================
 
+type searchPlan struct {
+	query       string
+	parsed      queryparser.FFFQuery
+	fuzzyText   string
+	fuzzyLower  string
+	tokens      []string
+	gitStatuses map[string]core.GitStatusKind
+}
+
+type scoredResult struct {
+	idx      uint32
+	score    int32
+	path     string
+	modified uint64
+}
+
 // Search 返回 top-N 结果。query 支持 "hello type:go size:>10KB modified:7d" 格式。
 func (p *Picker) Search(query string, limit int) ([]Result, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	// 没扫描：先扫一次（方便使用）
-	if !p.scanned.Load() {
-		if err := p.Scan(); err != nil {
-			return nil, err
-		}
+	if err := p.ensureScanned(); err != nil {
+		return nil, err
 	}
 
-	// 解析 query 为 fuzzy text + constraints
-	qp := queryparser.New()
-	parsed := qp.Parse(query)
-	fuzzyText := normalizeFuzzy(parsed.Fuzzy)
+	plan, err := p.prepareSearch(query)
+	if err != nil {
+		return nil, err
+	}
 
 	p.fileMu.RLock()
 	defer p.fileMu.RUnlock()
 	n := len(p.files)
-	if n == 0 {
+	if n == 0 && plan.gitStatuses == nil {
 		return nil, nil
 	}
 
-	// 候选集：如果 fuzzy 有意义，用 bigram；否则全量
-	var candidates []uint32
-	if fuzzyText != "" {
-		main := p.bg.Candidates(fuzzyText)
-		extra := p.overlay.Candidates(fuzzyText)
-		if len(main) == 0 && len(extra) == 0 {
-			candidates = makeRange(n)
-		} else {
-			candidates = append(main, extra...)
-		}
-	} else {
-		candidates = makeRange(n)
-	}
+	candidates := p.searchCandidates(plan.fuzzyText, n)
+	scoredBuf := p.scoreCandidates(candidates, plan)
+	scoredBuf = append(scoredBuf, p.scoreDeletedGitCandidates(plan)...)
+	p.sortScored(scoredBuf)
+	return p.resultsFromScored(scoredBuf, limit), nil
+}
 
-	// 评分 + 排序
-	type scored struct {
-		idx   uint32
-		score int32
+func (p *Picker) ensureScanned() error {
+	if p.scanned.Load() {
+		return nil
 	}
-	scoredBuf := make([]scored, 0, len(candidates))
+	return p.Scan()
+}
+
+func (p *Picker) prepareSearch(query string) (searchPlan, error) {
+	parsed := queryparser.New().Parse(query)
+	fuzzyText := normalizeFuzzy(parsed.Fuzzy)
+	gitStatuses, err := p.gitStatusesForQuery(parsed.Constraints)
+	if err != nil {
+		return searchPlan{}, err
+	}
 	fuzzyLower := strings.ToLower(fuzzyText)
-	tokens := strings.Fields(fuzzyLower)
+	return searchPlan{
+		query:       query,
+		parsed:      parsed,
+		fuzzyText:   fuzzyText,
+		fuzzyLower:  fuzzyLower,
+		tokens:      strings.Fields(fuzzyLower),
+		gitStatuses: gitStatuses,
+	}, nil
+}
 
+func (p *Picker) searchCandidates(fuzzyText string, n int) []uint32 {
+	if fuzzyText == "" {
+		return makeRange(n)
+	}
+	main := p.bg.Candidates(fuzzyText)
+	extra := p.overlay.Candidates(fuzzyText)
+	if len(main) == 0 && len(extra) == 0 {
+		return makeRange(n)
+	}
+	return append(main, extra...)
+}
+
+func (p *Picker) scoreCandidates(candidates []uint32, plan searchPlan) []scoredResult {
+	n := len(p.files)
+	scoredBuf := make([]scoredResult, 0, len(candidates))
 	for _, idx := range candidates {
 		if int(idx) >= n {
 			continue
@@ -292,94 +333,128 @@ func (p *Picker) Search(query string, limit int) ([]Result, error) {
 
 		// 应用约束过滤（extension/type/size/modified/glob/pathsegment/not）
 		relPath := p.arena.Get(f.Path)
-		if !matchesConstraints(relPath, f, parsed.Constraints, p.nowFn) {
+		if !matchesConstraints(relPath, f, plan.parsed.Constraints, p.nowFn, plan.gitStatuses) {
 			continue
 		}
 
 		// 基础分来自 TotalFrecency
 		base := f.TotalFrecency()
 
-		// fuzzy 匹配分
-		fuzzy := int32(0)
-		if fuzzyLower != "" {
-			relLower := strings.ToLower(relPath)
-			// 完整子串（最强）
-			if strings.Contains(relLower, fuzzyLower) {
-				fuzzy = 100
-			} else if len(tokens) > 1 {
-				// 多 token：全部包含
-				allContain := true
-				for _, tok := range tokens {
-					if !strings.Contains(relLower, tok) {
-						allContain = false
-						break
-					}
-				}
-				if allContain {
-					fuzzy = 60
-				} else {
-					// 部分命中
-					matched := 0
-					for _, tok := range tokens {
-						if strings.Contains(relLower, tok) {
-							matched++
-						}
-					}
-					if matched > 0 {
-						fuzzy = int32(10 * matched)
-					}
-				}
-			} else {
-				// 单 token 且未命中完整子串
-				allContain := true
-				for _, tok := range tokens {
-					if !strings.Contains(relLower, tok) {
-						allContain = false
-						break
-					}
-				}
-				if allContain {
-					fuzzy = 40
-				}
-			}
-			if f.IsBinary() {
-				fuzzy -= 20
-			}
-		}
+		fuzzy := scoreFuzzyPath(relPath, plan, f.IsBinary())
 
 		// combo boost
-		combo := int32(p.qt.ComboBoost(query, relPath))
+		combo := int32(p.qt.ComboBoost(plan.query, relPath))
 
 		total := base + fuzzy + combo
-		scoredBuf = append(scoredBuf, scored{idx: idx, score: total})
+		scoredBuf = append(scoredBuf, scoredResult{
+			idx:      idx,
+			score:    total,
+			modified: f.Modified,
+		})
 	}
+	return scoredBuf
+}
 
-	// 排序：score desc, modified desc, path lex asc
+func scoreFuzzyPath(relPath string, plan searchPlan, binary bool) int32 {
+	if plan.fuzzyLower == "" {
+		return 0
+	}
+	relLower := strings.ToLower(relPath)
+	fuzzy := int32(0)
+	if strings.Contains(relLower, plan.fuzzyLower) {
+		fuzzy = 100
+	} else if len(plan.tokens) > 1 {
+		matched := 0
+		for _, tok := range plan.tokens {
+			if strings.Contains(relLower, tok) {
+				matched++
+			}
+		}
+		if matched == len(plan.tokens) {
+			fuzzy = 60
+		} else if matched > 0 {
+			fuzzy = int32(10 * matched)
+		}
+	} else if containsAllTokens(relLower, plan.tokens) {
+		fuzzy = 40
+	}
+	if binary {
+		fuzzy -= 20
+	}
+	return fuzzy
+}
+
+func containsAllTokens(relLower string, tokens []string) bool {
+	for _, tok := range tokens {
+		if !strings.Contains(relLower, tok) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Picker) scoreDeletedGitCandidates(plan searchPlan) []scoredResult {
+	if plan.gitStatuses == nil {
+		return nil
+	}
+	var deleted []scoredResult
+	for relPath, status := range plan.gitStatuses {
+		if status != core.GitStatusDeleted {
+			continue
+		}
+		f := core.FileItem{}
+		if !matchesConstraints(relPath, &f, plan.parsed.Constraints, p.nowFn, plan.gitStatuses) {
+			continue
+		}
+		fuzzy := scoreFuzzyPath(relPath, plan, false)
+		combo := int32(p.qt.ComboBoost(plan.query, relPath))
+		deleted = append(deleted, scoredResult{
+			idx:   ^uint32(0),
+			score: fuzzy + combo,
+			path:  filepath.Join(p.root, relPath),
+		})
+	}
+	return deleted
+}
+
+func (p *Picker) sortScored(scoredBuf []scoredResult) {
 	sort.SliceStable(scoredBuf, func(i, j int) bool {
 		if scoredBuf[i].score != scoredBuf[j].score {
 			return scoredBuf[i].score > scoredBuf[j].score
 		}
-		fi := p.files[scoredBuf[i].idx]
-		fj := p.files[scoredBuf[j].idx]
-		if fi.Modified != fj.Modified {
-			return fi.Modified > fj.Modified
+		if scoredBuf[i].modified != scoredBuf[j].modified {
+			return scoredBuf[i].modified > scoredBuf[j].modified
 		}
-		return p.arena.Get(fi.Path) < p.arena.Get(fj.Path)
+		return p.scoredPath(scoredBuf[i]) < p.scoredPath(scoredBuf[j])
 	})
+}
 
+func (p *Picker) scoredPath(s scoredResult) string {
+	if s.path != "" {
+		return s.path
+	}
+	if int(s.idx) >= len(p.files) {
+		return ""
+	}
+	return filepath.Join(p.root, p.arena.Get(p.files[s.idx].Path))
+}
+
+func (p *Picker) resultsFromScored(scoredBuf []scoredResult, limit int) []Result {
 	if len(scoredBuf) > limit {
 		scoredBuf = scoredBuf[:limit]
 	}
-
 	out := make([]Result, len(scoredBuf))
 	for i, s := range scoredBuf {
-		out[i] = Result{idx: s.idx, score: s.score, p: p}
+		out[i] = Result{idx: s.idx, score: s.score, p: p, path: s.path}
 	}
-	return out, nil
+	return out
 }
 
 // Result 的只读访问器
 func (r Result) Path() string {
+	if r.path != "" {
+		return r.path
+	}
 	if r.p == nil {
 		return ""
 	}
@@ -430,22 +505,22 @@ func normalizeFuzzy(fq queryparser.FuzzyQuery) string {
 }
 
 // matchesConstraints 检查文件是否匹配所有约束（AND 语义）
-func matchesConstraints(relPath string, f *core.FileItem, constraints []queryparser.Constraint, nowFn func() time.Time) bool {
+func matchesConstraints(relPath string, f *core.FileItem, constraints []queryparser.Constraint, nowFn func() time.Time, gitStatuses map[string]core.GitStatusKind) bool {
 	for _, c := range constraints {
-		if !matchOne(relPath, f, c, nowFn) {
+		if !matchOne(relPath, f, c, nowFn, gitStatuses) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn func() time.Time) bool {
+func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn func() time.Time, gitStatuses map[string]core.GitStatusKind) bool {
 	switch c.Kind {
 	case queryparser.CNot:
 		if c.Child == nil {
 			return true
 		}
-		return !matchOne(relPath, f, *c.Child, nowFn)
+		return !matchOne(relPath, f, *c.Child, nowFn, gitStatuses)
 	case queryparser.CExtension:
 		// *.go -> 检查 ext
 		ext := strings.ToLower(filepath.Ext(relPath))
@@ -481,9 +556,7 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn 
 			return true
 		}
 	case queryparser.CGitStatus:
-		// GitStatusPtr 目前 Scan() 始终为 nil，故 git 探测尚未实现；
-		// 暂按不生效处理（返回 true），后续接入 git status 探测后完善此分支。
-		return true
+		return matchGitStatus(relPath, c.Value, gitStatuses)
 	case queryparser.CModifiedAgo:
 		secs, ok := parseDur(c.Value)
 		if !ok {
@@ -515,140 +588,170 @@ func matchOne(relPath string, f *core.FileItem, c queryparser.Constraint, nowFn 
 }
 
 // matchGlob 支持 "**/*.go" / "src/**/*.rs" 这样的 glob。** 匹配任意层级目录。
-// 简化实现：把 ** 替换为一个特殊匹配，其余用 filepath.Match 语义。
 func matchGlob(pattern, path string) bool {
 	lowerPat := strings.ToLower(pattern)
 	lowerPath := strings.ToLower(filepath.ToSlash(path))
 
-	// 如果没有 **，直接用 filepath.Match
 	if !strings.Contains(lowerPat, "**") {
 		ok, err := filepath.Match(lowerPat, lowerPath)
 		return err == nil && ok
 	}
+	return matchGlobSegments(splitGlobPath(lowerPat), splitGlobPath(lowerPath))
+}
 
-	// 有 **：用 greedy 分段匹配
-	// 把 pattern 按 ** 分割成片段 [prefix, middle..., suffix]
-	// 每段必须在 path 中按顺序出现，每段之间匹配任意内容
-	parts := strings.Split(lowerPat, "**")
-	pos := 0
+func splitGlobPath(path string) []string {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return []string{}
+	}
+	return strings.Split(trimmed, "/")
+}
 
-	for i, part := range parts {
-		if part == "" {
-			continue
+func matchGlobSegments(patternParts, pathParts []string) bool {
+	seen := make(map[[2]int]bool)
+	memo := make(map[[2]int]bool)
+	var match func(patternIdx, pathIdx int) bool
+	match = func(patternIdx, pathIdx int) bool {
+		key := [2]int{patternIdx, pathIdx}
+		if seen[key] {
+			return memo[key]
 		}
-		// 去掉 part 可能的开头 /
-		part = strings.TrimLeft(part, "/")
-		if i == 0 {
-			// 开头片段：必须匹配 path 的前缀
-			pathParts := strings.SplitN(lowerPath[pos:], "/", 2)
-			ok, _ := filepath.Match(part, pathParts[0])
-			if !ok {
-				// part 是复合路径模式（如 "pkg/src"），需要多段联合匹配
-				if strings.Contains(part, "/") {
-					segCount := strings.Count(part, "/") + 1
-					pathSegs := strings.SplitN(lowerPath[pos:], "/", segCount+1)
-					if len(pathSegs) < segCount {
-						return false
-					}
-					joined := strings.Join(pathSegs[:segCount], "/")
-					ok, _ := filepath.Match(part, joined)
-					if !ok {
-						return false
-					}
-					// 精确移动 pos（若 pos 已在末尾则不越界）
-					pos += len(joined)
-					if pos < len(lowerPath) && lowerPath[pos] == '/' {
-						pos++
-					}
-					continue
-				}
-				return false
-			}
-			// 移动 pos
-			pos += len(pathParts[0])
-			if pos < len(lowerPath) && lowerPath[pos] == '/' {
-				pos++
-			}
-			continue
+		seen[key] = true
+
+		ok := false
+		defer func() { memo[key] = ok }()
+
+		if patternIdx == len(patternParts) {
+			ok = pathIdx == len(pathParts)
+			return ok
 		}
-		if i == len(parts)-1 {
-			// 最后一段：必须匹配 path 尾部（后缀）
-			remainder := lowerPath[pos:]
-			// part 可能是 "*.go" 这样的模式，匹配路径末尾
-			// 尝试：找到最后一个 '/' 之后的部分匹配 part
-			lastSlash := strings.LastIndex(remainder, "/")
-			var tail string
-			if lastSlash >= 0 {
-				tail = remainder[lastSlash+1:]
-			} else {
-				tail = remainder
-			}
-			// 如果 part 不含 /，直接匹配文件名
-			if !strings.Contains(part, "/") {
-				ok, _ := filepath.Match(part, tail)
+		if patternParts[patternIdx] == "**" {
+			if match(patternIdx+1, pathIdx) {
+				ok = true
 				return ok
 			}
-			// 含 / 的后缀：从后向前匹配
-			partSegs := strings.Split(part, "/")
-			remSegs := strings.Split(remainder, "/")
-			if len(partSegs) > len(remSegs) {
-				return false
-			}
-			startIdx := len(remSegs) - len(partSegs)
-			matched := true
-			for j := range partSegs {
-				ok, _ := filepath.Match(partSegs[j], remSegs[startIdx+j])
-				if !ok {
-					matched = false
-					break
+			for i := pathIdx; i < len(pathParts); i++ {
+				if match(patternIdx+1, i+1) {
+					ok = true
+					return ok
 				}
 			}
-			return matched
-		}
-		// 中间片段：必须在剩余 path 中某位置匹配
-		remainder := lowerPath[pos:]
-		partSegs := strings.Split(part, "/")
-		remSegs := strings.Split(remainder, "/")
-		if len(partSegs) > len(remSegs) {
 			return false
 		}
-		found := false
-		for startIdx := 0; startIdx <= len(remSegs)-len(partSegs); startIdx++ {
-			ok := true
-			for j := range partSegs {
-				ok2, _ := filepath.Match(partSegs[j], remSegs[startIdx+j])
-				if !ok2 {
-					ok = false
-					break
-				}
-			}
-			if ok {
-				// 找到：移动 pos 到该段之后（含分隔符）
-				consumed := 0
-				for k := 0; k < startIdx+len(partSegs); k++ {
-					consumed += len(remSegs[k])
-					if k < startIdx+len(partSegs)-1 {
-						consumed++ // 每个段后的 '/'
-					}
-				}
-				pos += consumed
-				if pos < len(lowerPath) && lowerPath[pos] == '/' {
-					pos++
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
+		if pathIdx == len(pathParts) {
 			return false
+		}
+		matched, err := filepath.Match(patternParts[patternIdx], pathParts[pathIdx])
+		if err != nil || !matched {
+			return false
+		}
+		ok = match(patternIdx+1, pathIdx+1)
+		return ok
+	}
+	return match(0, 0)
+}
+
+func (p *Picker) gitStatusesForQuery(constraints []queryparser.Constraint) (map[string]core.GitStatusKind, error) {
+	if !hasGitStatusConstraint(constraints) {
+		return nil, nil
+	}
+	statuses, err := loadGitStatuses(p.root)
+	if err != nil {
+		return nil, fmt.Errorf("load git status: %w", err)
+	}
+	return statuses, nil
+}
+
+func hasGitStatusConstraint(constraints []queryparser.Constraint) bool {
+	for _, c := range constraints {
+		if c.Kind == queryparser.CGitStatus && isKnownGitStatusValue(c.Value) {
+			return true
+		}
+		if c.Kind == queryparser.CNot && c.Child != nil && hasGitStatusConstraint([]queryparser.Constraint{*c.Child}) {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+func isKnownGitStatusValue(value string) bool {
+	switch strings.ToLower(value) {
+	case "modified", "added", "deleted", "renamed", "untracked", "clean", "dirty":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadGitStatuses(root string) (map[string]core.GitStatusKind, error) {
+	cmd := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git status --porcelain failed in %q: %w: %s", root, err, strings.TrimSpace(string(out)))
+	}
+	statuses := make(map[string]core.GitStatusKind)
+	fields := bytes.Split(out, []byte{0})
+	for i := 0; i < len(fields); i++ {
+		field := fields[i]
+		if len(field) < 4 {
+			continue
+		}
+		kind, ok := parseGitPorcelainKind(field[0], field[1])
+		if !ok {
+			continue
+		}
+		pathField := string(field[3:])
+		if isRenameOrCopy(field[0], field[1]) && i+1 < len(fields) {
+			i++
+		}
+		statuses[filepath.ToSlash(pathField)] = kind
+	}
+	return statuses, nil
+}
+
+func isRenameOrCopy(index, worktree byte) bool {
+	return index == 'R' || worktree == 'R' || index == 'C' || worktree == 'C'
+}
+
+func parseGitPorcelainKind(index, worktree byte) (core.GitStatusKind, bool) {
+	if index == '?' && worktree == '?' {
+		return core.GitStatusUntracked, true
+	}
+	if index == 'R' || worktree == 'R' {
+		return core.GitStatusRenamed, true
+	}
+	if index == 'D' || worktree == 'D' {
+		return core.GitStatusDeleted, true
+	}
+	if index == 'A' || worktree == 'A' {
+		return core.GitStatusAdded, true
+	}
+	if index == 'M' || worktree == 'M' {
+		return core.GitStatusModified, true
+	}
+	return core.GitStatusClean, false
+}
+
+func matchGitStatus(relPath, want string, statuses map[string]core.GitStatusKind) bool {
+	if statuses == nil {
+		return true
+	}
+	status, dirty := statuses[filepath.ToSlash(relPath)]
+	if !dirty {
+		status = core.GitStatusClean
+	}
+	want = strings.ToLower(want)
+	switch want {
+	case "dirty":
+		return core.GitStatus{Kind: status}.IsDirty()
+	case "modified", "added", "deleted", "renamed", "untracked", "clean":
+		return status.String() == want
+	default:
+		return true
+	}
 }
 
 // parseDur 解析 "7d" / "24h" 为秒
 func parseDur(v string) (int64, bool) {
 	return queryparser.ParseDurationAgo(v)
 }
-
-

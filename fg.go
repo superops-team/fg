@@ -12,15 +12,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yourname/fg/picker"
+	"github.com/superops-team/fg/picker"
 )
 
 // Options 控制搜索行为
 type Options struct {
-	Root        string        // 搜索根目录（默认当前目录）
-	Query       string        // 查询（fuzzy text + type/size/modified/glob 约束）
-	Limit       int           // 返回结果上限（默认 20）
-	NowFunc     func() time.Time // 注入时间（测试用）
+	Root    string           // 搜索根目录（默认当前目录）
+	Query   string           // 查询（fuzzy text + type/size/modified/glob 约束）
+	Limit   int              // 返回结果上限（默认 20）
+	NowFunc func() time.Time // 注入时间（测试用）
 }
 
 // Result 是搜索结果（只读）

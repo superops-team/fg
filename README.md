@@ -50,7 +50,7 @@ go build -o fg ./cmd/fg
 作为库使用：
 
 ```go
-import "github.com/yourname/fg"
+import "github.com/superops-team/fg"
 
 results, err := fg.Search(".", "type:go main", 20)
 for _, r := range results {

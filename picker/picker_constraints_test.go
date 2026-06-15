@@ -2,6 +2,7 @@ package picker
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -71,6 +72,79 @@ func TestPicker_ConstraintGlob(t *testing.T) {
 	}
 	if len(res) != 2 {
 		t.Fatalf("**/*.go 应返回 2 条，got %d", len(res))
+	}
+}
+
+func TestMatchGlob_Table(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		path    string
+		want    bool
+	}{
+		{
+			name:    "plain glob matches file in same directory",
+			pattern: "*.go",
+			path:    "main.go",
+			want:    true,
+		},
+		{
+			name:    "plain glob does not cross directory separator",
+			pattern: "*.go",
+			path:    "pkg/main.go",
+			want:    false,
+		},
+		{
+			name:    "recursive glob matches root file",
+			pattern: "**/*.go",
+			path:    "main.go",
+			want:    true,
+		},
+		{
+			name:    "recursive glob matches nested file",
+			pattern: "**/*.go",
+			path:    "pkg/main.go",
+			want:    true,
+		},
+		{
+			name:    "recursive glob after prefix matches zero subdirectories",
+			pattern: "src/**/*.go",
+			path:    "src/main.go",
+			want:    true,
+		},
+		{
+			name:    "recursive glob after prefix matches nested subdirectories",
+			pattern: "src/**/*.go",
+			path:    "src/pkg/main.go",
+			want:    true,
+		},
+		{
+			name:    "recursive glob does not match wrong prefix",
+			pattern: "src/**/*.go",
+			path:    "pkg/main.go",
+			want:    false,
+		},
+		{
+			name:    "case insensitive match",
+			pattern: "SRC/**/*.GO",
+			path:    "src/pkg/main.go",
+			want:    true,
+		},
+		{
+			name:    "invalid pattern returns false",
+			pattern: "[",
+			path:    "main.go",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchGlob(tt.pattern, tt.path)
+			if got != tt.want {
+				t.Fatalf("matchGlob(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -184,6 +258,97 @@ func TestPicker_ConstraintPathSegment(t *testing.T) {
 	}
 }
 
+func TestPicker_StatusConstraintLoadsGitStatusLazily(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "staged.go", "package staged\n")
+	mustWrite(t, root, "untracked.go", "package untracked\n")
+	runGit(t, root, "init")
+	runGit(t, root, "add", "staged.go")
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < p.FileCount(); i++ {
+		if got := p.FileAt(i).GitStatus(); got != nil {
+			t.Fatalf("Scan() 不应预加载 git status，index=%d status=%+v", i, got)
+		}
+	}
+
+	res, err := p.Search("status:untracked", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("status:untracked 应只返回 1 条，got %d", len(res))
+	}
+	if filepath.Base(res[0].Path()) != "untracked.go" {
+		t.Fatalf("status:untracked 应返回 untracked.go，got %s", res[0].Path())
+	}
+}
+
+func TestPicker_UnknownStatusConstraintDoesNotRequireGit(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "main.go", "package main\n")
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("status:unknown", 10)
+	if err != nil {
+		t.Fatalf("未知 status 值不应加载 git status 或返回错误: %v", err)
+	}
+	if len(res) != 1 || filepath.Base(res[0].Path()) != "main.go" {
+		t.Fatalf("未知 status 值应保持向后兼容不参与过滤，got %+v", res)
+	}
+}
+
+func TestPicker_StatusConstraintHandlesPathWithSpaces(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "space name.go", "package spaced\n")
+	runGit(t, root, "init")
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("status:untracked", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || filepath.Base(res[0].Path()) != "space name.go" {
+		t.Fatalf("status:untracked 应正确匹配带空格路径，got %+v", res)
+	}
+}
+
+func TestPicker_StatusDeletedReturnsDeletedTrackedPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "deleted.go", "package deleted\n")
+	runGit(t, root, "init")
+	runGit(t, root, "add", "deleted.go")
+	runGit(t, root, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init")
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(root, Options{})
+	defer p.Close()
+	res, err := p.Search("status:deleted", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || filepath.Base(res[0].Path()) != "deleted.go" {
+		t.Fatalf("status:deleted 应返回已删除 tracked path，got %+v", res)
+	}
+}
+
 // helper
 func mustWrite(t *testing.T, root, relPath, content string) {
 	t.Helper()
@@ -193,5 +358,14 @@ func mustWrite(t *testing.T, root, relPath, content string) {
 	}
 	if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func runGit(t *testing.T, root string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 }

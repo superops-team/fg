@@ -9,13 +9,14 @@ package grep
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
-	"github.com/yourname/fg/core"
+	"github.com/superops-team/fg/core"
 )
 
 // MatchRange 表示单个行内 match 的 [start,end) 字节区间
@@ -26,9 +27,9 @@ type MatchRange struct {
 
 // LineResult 表示单行匹配结果
 type LineResult struct {
-	Lineno   int          // 1-based
-	Text     string       // 行内容（不含换行）
-	Matches  []MatchRange // 该行内所有 match 区间
+	Lineno  int          // 1-based
+	Text    string       // 行内容（不含换行）
+	Matches []MatchRange // 该行内所有 match 区间
 }
 
 // FileResult 表示单文件的匹配结果
@@ -40,9 +41,9 @@ type FileResult struct {
 // Options 控制 GrepMatcher 行为
 type Options struct {
 	CaseInsensitive bool // 大小写不敏感（默认：查询不含大写字母时自动不敏感）
-	IncludeBinary     bool // 是否也搜索 binary 文件（默认跳过）
-	MaxBytes          int  // 单文件最大扫描字节（默认 2MB）
-	Concurrency       int  // GrepMany 并发数（默认 4）
+	IncludeBinary   bool // 是否也搜索 binary 文件（默认跳过）
+	MaxBytes        int  // 单文件最大扫描字节（默认 2MB）
+	Concurrency     int  // GrepMany 并发数（默认 4）
 }
 
 // GrepMatcher 是线程安全的匹配器
@@ -174,6 +175,7 @@ func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int)
 	sem := make(chan struct{}, g.opts.Concurrency)
 	var wg sync.WaitGroup
 	resultsCh := make(chan FileResult, len(paths))
+	errsCh := make(chan error, len(paths))
 
 	for _, p := range paths {
 		wg.Add(1)
@@ -183,6 +185,7 @@ func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int)
 			defer func() { <-sem }() // release
 			lines, err := g.SearchFile(path, query, limitPerFile)
 			if err != nil {
+				errsCh <- fmt.Errorf("%s: %w", path, err)
 				return
 			}
 			if len(lines) == 0 {
@@ -193,12 +196,17 @@ func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int)
 	}
 	wg.Wait()
 	close(resultsCh)
+	close(errsCh)
 
 	out := make([]FileResult, 0, len(paths))
 	for fr := range resultsCh {
 		out = append(out, fr)
 	}
-	return out, nil
+	errs := make([]error, 0)
+	for err := range errsCh {
+		errs = append(errs, err)
+	}
+	return out, errors.Join(errs...)
 }
 
 // ================================================================

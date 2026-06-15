@@ -1,4 +1,4 @@
-module github.com/yourname/fg
+module github.com/superops-team/fg
 
 go 1.25.1
 

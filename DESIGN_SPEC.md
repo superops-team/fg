@@ -1,7 +1,7 @@
-# go-fff 设计规格（v1.0 · 落地版）
+# fg 设计规格（v1.1 · 发布契约落地版）
 
-> 目标：用 Go 复刻 Rust `fff-search` / `fff-query-parser` 的核心能力。
-> 版本原则：**先跑通，再优化；可测试，可替换；纯 Go 优先**。
+> 目标：提供一个 Go 实现的轻量级 fuzzy file finder，既可作为 library 使用，也可通过极简 CLI 使用。
+> 版本原则：**先跑通，再优化；可测试，可替换；纯 Go 优先；公开契约必须可执行**。
 
 ---
 
@@ -10,8 +10,107 @@
 - **不**追求逐行对齐 Rust 源码的实现细节
 - **不**默认绑 CGO / libgit2 / LMDB（有纯 Go 替代）
 - **不**在 v1 写手写 AVX2 asm（先 bench 再决定）
-- **不**做 GUI / TUI 前端（只提供 library + 一个极简 CLI demo）
+- **不**做 GUI / TUI 前端（只提供 library + 一个极简 CLI）
 - **不**自己写 `.gitignore` 解析器（复用成熟库）
+- **不**在 CLI MVP 引入 Cobra/Viper；当前 flag 数量少，优先使用标准库 `flag`
+- **不**在本阶段产品化持久化 frecency/combo；默认 API 仍使用内存 tracker
+
+---
+
+## 0.1 公开发布契约（v1.1）
+
+### Go module
+
+- Canonical module path: `github.com/superops-team/fg`
+- 所有内部 import 必须使用该 module path。
+- README 中的 library 示例必须与 `go.mod` 保持一致。
+
+### Library API
+
+顶层包 `github.com/superops-team/fg` 提供最小稳定入口：
+
+```go
+results, err := fg.Search(root, query, limit)
+results, err := fg.SearchWith(fg.Options{Root: root, Query: query, Limit: limit})
+```
+
+行为契约：
+
+- `limit <= 0` 时默认返回最多 20 条。
+- `root == ""` 或空白字符串时使用当前工作目录。
+- `root` 不存在或不是目录时返回 error。
+- `Options.NowFunc` 只用于测试和确定性时间约束，不改变默认行为。
+
+### CLI MVP
+
+CLI 入口固定为 `cmd/fg`，构建命令必须可执行：
+
+```bash
+go build -o fg ./cmd/fg
+```
+
+CLI 使用标准库 `flag` 实现，MVP flags：
+
+| 命令 | 行为 |
+|------|------|
+| `fg "query"` | 在当前目录执行文件搜索，stdout 每行输出一个 path |
+| `fg -r ROOT "query"` | 在指定 root 执行文件搜索 |
+| `fg --score "query"` | stdout 每行输出 `score<TAB>path` |
+| `fg --grep TEXT` | 在 root 下执行内容 grep，默认最多输出 20 个文件命中 |
+| `fg "file query" --grep TEXT` | 先执行文件搜索，再对搜索结果执行内容 grep |
+| `fg --limit N` | 限制输出数量，默认 20 |
+| `fg -h` / `fg --help` | 输出帮助，退出码 0 |
+
+I/O 约定：
+
+- 正常结果只写 stdout。
+- 错误只写 stderr。
+- 使用错误退出码 1。
+- 参数错误退出码 2。
+
+CLI MVP 不提供交互式 picker、不提供 shell completion、不提供配置文件。
+
+---
+
+## 0.2 查询语义与错误传播契约（v1.2）
+
+### `status:*` lazy git filtering
+
+- `Picker.Scan()` 只负责文件系统扫描、基础 metadata、binary 探测与 bigram 构建；**不得执行 `git status`**。
+- `Picker.Search()` 在解析 query 后检查是否存在 `CGitStatus` 约束。
+- 只有查询包含 `status:*` 时，`Search()` 才读取当前 root 的 `git status --porcelain` 输出，并且该状态只在本次搜索内参与过滤。
+- 非 git 仓库、未安装 git、或 `git status` 执行失败时，`Search()` 必须返回带上下文的 error，不得把 `status:*` 退化为全量匹配。
+- 支持值：`modified`、`added`、`deleted`、`renamed`、`untracked`、`clean`、`dirty`。未知值保持向后兼容：不参与过滤。
+
+### `grep.SearchMany` partial failure contract
+
+- `grep.SearchMany(paths, query, limitPerFile)` 并发搜索多个文件时，一个文件失败不得阻止其他文件返回命中结果。
+- 每个文件失败时记录 `fmt.Errorf("%s: %w", path, err)`。
+- 所有 goroutine 结束后，返回已收集的非空命中结果，并通过 `errors.Join(errs...)` 返回聚合错误。
+- 调用方可用 `errors.Is` / `errors.As` 检查聚合错误中的底层错误。
+
+---
+
+## 0.3 可维护性契约（v1.3）
+
+### `picker.Search` phase decomposition
+
+`Picker.Search()` 是搜索主控制流，但不得把解析、候选集、过滤、打分、排序、结果映射全部堆在一个长函数内。实现必须拆分为私有阶段函数：
+
+1. 确保索引已扫描。
+2. 解析 query，得到 fuzzy text、constraints 和 lazy 依赖（例如 `status:*`）。
+3. 根据 fuzzy text 生成候选集。
+4. 对候选执行约束过滤与评分。
+5. 按 score、modified、path 稳定排序。
+6. 应用 limit 并映射为 `[]Result`。
+
+拆分后的私有函数不扩大 public API；行为仍由现有 `Search()` 契约与测试保护。
+
+### glob matching coverage
+
+- `matchGlob` 必须用表驱动测试覆盖普通 glob、`**` 递归 glob、大小写归一、负例与非法 pattern。
+- `**` 语义为“零个或多个目录层级”：`**/*.go` 必须同时匹配 `main.go` 和 `pkg/main.go`；`src/**/*.go` 必须同时匹配 `src/main.go` 和 `src/pkg/main.go`。
+- 普通 `filepath.Match` 错误（例如非法字符类）必须安全返回 false，不得 panic。
 
 ---
 
@@ -63,7 +162,7 @@
 ## 2. 包结构与职责边界
 
 ```
-github.com/yourname/go-fff/                 ← 顶层 re-export (仅类型别名)
+github.com/superops-team/fg/                ← 顶层 library API
 ├── core/                    ← 数据结构 + 轻量工具；零第三方依赖
 │   ├── types.go             FileItem, DirItem, FileFlags, PaginationArgs
 │   ├── git_status.go        GitStatus enum + 可扩展字段

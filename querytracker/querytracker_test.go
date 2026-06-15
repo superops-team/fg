@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yourname/fg/kv"
+	"github.com/superops-team/fg/kv"
 )
 
 func TestQueryTracker_Basic(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourname/fg/kv"
+	"github.com/superops-team/fg/kv"
 )
 
 // =======================================================

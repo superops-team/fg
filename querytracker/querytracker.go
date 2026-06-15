@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yourname/fg/kv"
+	"github.com/superops-team/fg/kv"
 )
 
 // QueryTracker 维护 (query, path) -> 选择次数 的映射。

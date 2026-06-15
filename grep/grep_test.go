@@ -2,6 +2,7 @@ package grep
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,6 +188,31 @@ func TestGrep_ManyConcurrent(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("应共命中 2 行， got %d (results=%+v)", total, results)
+	}
+}
+
+func TestGrep_SearchManyReturnsMatchesAndJoinedErrors(t *testing.T) {
+	dir := t.TempDir()
+	good := writeTestFile(t, dir, "good.txt", "alpha needle\n")
+	missing := filepath.Join(dir, "missing.txt")
+
+	m := New(Options{Concurrency: 2})
+	results, err := m.SearchMany([]string{good, missing}, "needle", 5)
+
+	if err == nil {
+		t.Fatal("SearchMany 应返回缺失文件的聚合 error")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SearchMany error 应保留 os.ErrNotExist 链，got %v", err)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("SearchMany error 应包含失败文件路径 %q，got %v", missing, err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("SearchMany 应同时返回成功文件的命中结果，got %d: %+v", len(results), results)
+	}
+	if results[0].Path != good || len(results[0].Lines) != 1 {
+		t.Fatalf("SearchMany 成功结果不正确: %+v", results)
 	}
 }
 

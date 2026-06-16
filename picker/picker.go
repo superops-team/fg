@@ -238,6 +238,8 @@ func (p *Picker) Scan() error {
 // Search: fuzzy 模糊搜索 + bigram 预过滤 + 排序
 // ================================================================
 
+const virtualDeletedIndex = ^uint32(0)
+
 type searchPlan struct {
 	query       string
 	parsed      queryparser.FFFQuery
@@ -419,7 +421,7 @@ func (p *Picker) scoreDeletedGitCandidates(plan searchPlan) []scoredResult {
 		fuzzy := scoreFuzzyPath(relPath, plan, false)
 		combo := int32(p.qt.ComboBoost(plan.query, relPath))
 		deleted = append(deleted, scoredResult{
-			idx:   ^uint32(0),
+			idx:   virtualDeletedIndex,
 			score: fuzzy + combo,
 			path:  filepath.Join(p.root, relPath),
 		})
@@ -478,7 +480,12 @@ func (r Result) Path() string {
 }
 
 func (r Result) Score() int32 { return r.score }
-func (r Result) Index() int   { return int(r.idx) }
+func (r Result) Index() int {
+	if r.idx == virtualDeletedIndex {
+		return -1
+	}
+	return int(r.idx)
+}
 
 // Close 释放资源
 func (p *Picker) Close() error {
@@ -660,17 +667,14 @@ func splitGlobPath(path string) []string {
 }
 
 func matchGlobSegments(patternParts, pathParts []string) bool {
-	seen := make(map[[2]int]bool)
 	memo := make(map[[2]int]bool)
 	var match func(patternIdx, pathIdx int) bool
 	match = func(patternIdx, pathIdx int) bool {
 		key := [2]int{patternIdx, pathIdx}
-		if seen[key] {
-			return memo[key]
+		if ok, cached := memo[key]; cached {
+			return ok
 		}
-		seen[key] = true
-
-		ok := false
+		var ok bool
 		defer func() { memo[key] = ok }()
 
 		if patternIdx == len(patternParts) {
@@ -785,6 +789,8 @@ func parseGitPorcelainKind(index, worktree byte) (core.GitStatusKind, bool) {
 }
 
 func matchGitStatus(relPath, want string, statuses map[string]core.GitStatusKind) bool {
+	// 当没有加载 git status 数据时，status 约束不做过滤（由 caller 负责控制调用时机）。
+	// 例如虚拟 deleted 文件的约束检查中，caller 会确保此时不包含其他需要文件元数据的约束。
 	if statuses == nil {
 		return true
 	}

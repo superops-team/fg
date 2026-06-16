@@ -90,19 +90,24 @@ func (g *GrepMatcher) SearchFile(path, query string, limit int) ([]LineResult, e
 
 	// 先读前 16KB 判断是否为 binary
 	headBuf := g.pool.Get()
-	n, _ := f.Read(*headBuf)
-	// 重置位置
-	_, _ = f.Seek(0, io.SeekStart)
+	n, readErr := f.Read(*headBuf)
+	_, seekErr := f.Seek(0, io.SeekStart)
 	isBinary := core.DetectBinaryContent((*headBuf)[:n])
 	g.pool.Put(headBuf)
 	if isBinary && !g.opts.IncludeBinary {
 		return nil, nil
 	}
+	if readErr != nil && n == 0 {
+		return nil, fmt.Errorf("read %s: %w", path, readErr)
+	}
+	if seekErr != nil {
+		return nil, fmt.Errorf("seek %s: %w", path, seekErr)
+	}
 
 	// 解析 tokens（支持 "foo bar" -> ["foo","bar"]）
+	caseInsensitive := g.opts.CaseInsensitive || isAllLower(query)
 	var tokens []string
-	if g.opts.CaseInsensitive || isAllLower(query) {
-		// 大小写不敏感处理：归一化为小写
+	if caseInsensitive {
 		tokens = strings.Fields(strings.ToLower(query))
 	} else {
 		tokens = strings.Fields(query)
@@ -110,7 +115,6 @@ func (g *GrepMatcher) SearchFile(path, query string, limit int) ([]LineResult, e
 	if len(tokens) == 0 {
 		return nil, nil
 	}
-	caseInsensitive := g.opts.CaseInsensitive || isAllLower(query)
 
 	results := make([]LineResult, 0, 8)
 	if err := g.searchReaderLines(f, tokens, caseInsensitive, limit, &results); err != nil {
@@ -300,13 +304,6 @@ func isAllLower(s string) bool {
 	return true
 }
 
-// findCaseInsensitive 在 line 中查找 tok 的首次出现位置（不区分大小写）。
-// 返回 line 中的字节偏移。使用 rune 边界扫描，确保非 ASCII 内容的偏移也正确。
-func findCaseInsensitive(line, tok string) int {
-	start, _ := findCaseInsensitiveRange(line, tok)
-	return start
-}
-
 func findCaseInsensitiveRange(line, tok string) (int, int) {
 	if tok == "" {
 		return -1, -1
@@ -316,26 +313,33 @@ func findCaseInsensitiveRange(line, tok string) (int, int) {
 		return idx, idx + len(tok)
 	}
 	lowerTok := strings.ToLower(tok)
-	// 在 line 的每个 rune 起点检查小写后的前缀是否匹配，并返回原始字符串字节区间。
+	// 在 line 的每个 rune 起点检查小写后的前缀是否匹配 lowerTok。
+	// 从每个 rune 起点开始，按 rune 扩展 end，直到累积的小写字节数 >= len(lowerTok)。
+	// 使用 utf8.RuneCountInString 确保在处理前对齐 rune 边界，避免 Unicode 大小写折叠改变字节长度。
+	// 策略：先在归一化的整行里找到 lowerTok 的位置（忽略字节长度变化），再映射回原 line 的字节位置。
+	tokRuneCount := utf8.RuneCountInString(tok)
+	// 直接按 rune 边界扫描 line，对每个起点截取 tokRuneCount 个 rune 后比较。
 	for i := 0; i < len(line); {
-		rest := line[i:]
-		loweredLen := 0
-		for end := i; end < len(line); {
+		// 从位置 i 开始，收集 tokRuneCount 个 rune 的字节区间
+		end := i
+		runeCount := 0
+		for runeCount < tokRuneCount && end < len(line) {
 			_, size := utf8.DecodeRuneInString(line[end:])
 			if size <= 0 {
 				size = 1
 			}
 			end += size
-			loweredLen = len(strings.ToLower(line[i:end]))
-			if loweredLen >= len(lowerTok) {
-				if strings.ToLower(line[i:end]) == lowerTok {
-					return i, end
-				}
-				break
-			}
+			runeCount++
 		}
-		// 按 rune 步进
-		_, size := utf8.DecodeRuneInString(rest)
+		if runeCount < tokRuneCount {
+			// 剩余不足 tokRuneCount 个 rune，结束
+			break
+		}
+		if strings.ToLower(line[i:end]) == lowerTok {
+			return i, end
+		}
+		// 前进到下一个 rune 起点
+		_, size := utf8.DecodeRuneInString(line[i:])
 		if size <= 0 {
 			size = 1
 		}

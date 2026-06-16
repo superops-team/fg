@@ -13,6 +13,19 @@ type Bigram struct {
 	fileCount int
 }
 
+type CandidateState uint8
+
+const (
+	CandidatesUnavailable CandidateState = iota
+	CandidatesNoMatch
+	CandidatesFound
+)
+
+type CandidateOutcome struct {
+	State      CandidateState
+	Candidates []uint32
+}
+
 func NewBigram() *Bigram { return &Bigram{} }
 
 func makeBigram(a, b byte) uint16 { return uint16(a)<<8 | uint16(b) }
@@ -82,20 +95,28 @@ func extractQueryBigrams(q string) []uint16 {
 // Candidates 返回候选文件 index 集合（AND 语义）。
 // 空查询返回 nil，未命中查询返回空切片。
 func (b *Bigram) Candidates(query string) []uint32 {
+	outcome := b.CandidateOutcome(query)
+	if outcome.State == CandidatesUnavailable {
+		return nil
+	}
+	return outcome.Candidates
+}
+
+func (b *Bigram) CandidateOutcome(query string) CandidateOutcome {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if query == "" || b.fileCount == 0 {
-		return nil
+		return CandidateOutcome{State: CandidatesUnavailable}
 	}
 	qBigrams := extractQueryBigrams(query)
 	if len(qBigrams) == 0 {
-		return nil
+		return CandidateOutcome{State: CandidatesUnavailable}
 	}
 	var sets [][]uint32
 	for _, bg := range qBigrams {
 		s := b.index[bg]
 		if len(s) == 0 {
-			return []uint32{}
+			return CandidateOutcome{State: CandidatesNoMatch, Candidates: []uint32{}}
 		}
 		sets = append(sets, s)
 	}
@@ -112,7 +133,7 @@ func (b *Bigram) Candidates(query string) []uint32 {
 	if len(rest) == 0 {
 		out := make([]uint32, len(baseline))
 		copy(out, baseline)
-		return out
+		return CandidateOutcome{State: CandidatesFound, Candidates: out}
 	}
 	result := make([]uint32, 0, len(baseline))
 	for _, v := range baseline {
@@ -127,7 +148,10 @@ func (b *Bigram) Candidates(query string) []uint32 {
 			result = append(result, v)
 		}
 	}
-	return result
+	if len(result) == 0 {
+		return CandidateOutcome{State: CandidatesNoMatch, Candidates: result}
+	}
+	return CandidateOutcome{State: CandidatesFound, Candidates: result}
 }
 
 // Matches 返回 file 是否在 or 语义上匹配查询（任意 bigram 命中即视为可能命中）。
@@ -203,20 +227,28 @@ func (o *BigramOverlay) FileCount() int {
 }
 
 func (o *BigramOverlay) Candidates(query string) []uint32 {
+	outcome := o.CandidateOutcome(query)
+	if outcome.State == CandidatesUnavailable {
+		return nil
+	}
+	return outcome.Candidates
+}
+
+func (o *BigramOverlay) CandidateOutcome(query string) CandidateOutcome {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	if query == "" || o.fileCount == 0 {
-		return nil
+		return CandidateOutcome{State: CandidatesUnavailable}
 	}
 	qBigrams := extractQueryBigrams(query)
 	if len(qBigrams) == 0 {
-		return nil
+		return CandidateOutcome{State: CandidatesUnavailable}
 	}
 	var sets [][]uint32
 	for _, bg := range qBigrams {
 		s := o.index[bg]
 		if len(s) == 0 {
-			return []uint32{}
+			return CandidateOutcome{State: CandidatesNoMatch, Candidates: []uint32{}}
 		}
 		sets = append(sets, s)
 	}
@@ -232,7 +264,7 @@ func (o *BigramOverlay) Candidates(query string) []uint32 {
 	if len(rest) == 0 {
 		out := make([]uint32, len(baseline))
 		copy(out, baseline)
-		return out
+		return CandidateOutcome{State: CandidatesFound, Candidates: out}
 	}
 	result := make([]uint32, 0, len(baseline))
 	for _, v := range baseline {
@@ -247,7 +279,10 @@ func (o *BigramOverlay) Candidates(query string) []uint32 {
 			result = append(result, v)
 		}
 	}
-	return result
+	if len(result) == 0 {
+		return CandidateOutcome{State: CandidatesNoMatch, Candidates: result}
+	}
+	return CandidateOutcome{State: CandidatesFound, Candidates: result}
 }
 
 func (o *BigramOverlay) Reset() {

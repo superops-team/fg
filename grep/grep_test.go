@@ -2,6 +2,7 @@ package grep
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -189,6 +190,68 @@ func TestGrep_ManyConcurrent(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("应共命中 2 行， got %d (results=%+v)", total, results)
+	}
+}
+
+func TestGrep_SearchFileContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	fp := writeTestFile(t, dir, "cancel.txt", "needle\n")
+	m := New(Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, err := m.SearchFileContext(ctx, fp, "needle", 5)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SearchFileContext error = %v, want context.Canceled", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canceled grep must not return partial results, got %+v", results)
+	}
+}
+
+func TestGrep_SearchManyContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{writeTestFile(t, dir, "cancel-many.txt", "needle\n")}
+	m := New(Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, err := m.SearchManyContext(ctx, files, "needle", 5)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SearchManyContext error = %v, want context.Canceled", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canceled grep many must not return partial results, got %+v", results)
+	}
+}
+
+func TestGrep_SearchManyContextDropsPartialResultsWhenCanceledDuringWork(t *testing.T) {
+	dir := t.TempDir()
+	fast := writeTestFile(t, dir, "fast.txt", "needle\n")
+	slow := writeTestFile(t, dir, "slow.txt", strings.Repeat("x", 2*1024*1024))
+	m := New(Options{Concurrency: 1, MaxBytes: 2 * 1024 * 1024})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				cancel()
+			}
+		}
+	}()
+	results, err := m.SearchManyContext(ctx, []string{fast, slow}, "needle", 5)
+	done <- struct{}{}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SearchManyContext error = %v, want context.Canceled", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canceled SearchManyContext must drop partial results, got %+v", results)
 	}
 }
 

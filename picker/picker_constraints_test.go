@@ -1,9 +1,11 @@
 package picker
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,7 +177,9 @@ func TestPicker_ConstraintSize(t *testing.T) {
 	for _, r := range res {
 		if filepath.Base(r.Path()) == "big.txt" {
 			gotBig = true
-			break
+		}
+		if filepath.Base(r.Path()) == "small.txt" {
+			t.Fatalf("size:>1KB must exclude small.txt, got %+v", res)
 		}
 	}
 	if !gotBig {
@@ -191,11 +195,35 @@ func TestPicker_ConstraintSize(t *testing.T) {
 	for _, r := range res2 {
 		if filepath.Base(r.Path()) == "small.txt" {
 			gotSmall = true
-			break
+		}
+		if filepath.Base(r.Path()) == "big.txt" {
+			t.Fatalf("size:<100B must exclude big.txt, got %+v", res2)
 		}
 	}
 	if !gotSmall {
 		t.Fatalf("size:<100B 应返回 small.txt，got %d 条: %v", len(res2), res2)
+	}
+}
+
+func TestPicker_ConstraintGlobHasNegativeAssertion(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "pkg/a/main.go", "package main\n")
+	mustWrite(t, root, "pkg/b/util.go", "package util\n")
+	mustWrite(t, root, "README.md", "# readme\n")
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Search("**/*.go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		if filepath.Base(r.Path()) == "README.md" {
+			t.Fatalf("glob **/*.go must exclude README.md, got %+v", res)
+		}
 	}
 }
 
@@ -385,6 +413,44 @@ func TestPicker_StatusDeletedVirtualResultDoesNotUseZeroMetadata(t *testing.T) {
 	}
 	if len(res) != 0 {
 		t.Fatalf("virtual deleted result must not be matched using zero-value size metadata, got %+v", res)
+	}
+}
+
+func TestPicker_StatusConstraintErrorsOutsideGitRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "main.go", "package main\n")
+
+	p := New(root, Options{})
+	defer p.Close()
+	_, err := p.Search("status:modified", 10)
+	if err == nil {
+		t.Fatal("status:modified outside git repository should return explicit error")
+	}
+	if !strings.Contains(err.Error(), "load git status") {
+		t.Fatalf("error should identify git status dependency, got %v", err)
+	}
+}
+
+func TestPicker_StatusConstraintContextDeadlineExceeded(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	mustWrite(t, root, "main.go", "package main\n")
+
+	p := New(root, Options{})
+	defer p.Close()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	results, err := p.SearchContext(ctx, "status:modified", 10)
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("status search should honor context deadline, got results=%+v err=%v", results, err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("deadline-exceeded status search must not return partial results, got %+v", results)
 	}
 }
 

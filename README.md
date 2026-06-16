@@ -1,15 +1,18 @@
 # fg — fuzzy file finder
 
-基于 Go 的轻量级模糊文件搜索工具，采用 SDD（规格驱动开发）+ TDD（测试驱动开发）实现。
+`fg` 是一个基于 Go 的轻量级模糊文件搜索与内容 grep 工具，也提供可复用的库 API，适合交互式搜索、脚本调用和 agent/runtime 场景。
 
-## 功能
+## 当前能力概览
 
-- **模糊文件搜索**：`fg "type:go main util"` 按文件名 + 相对路径做模糊匹配
-- **bigram 预过滤**：10k 级文件规模下先定位候选集，再精细匹配（性能 ~10×）
-- **约束解析**：`type:go`、`*.go`、`size:>1KB`、`modified:7d`、`/src/`、`**/*.go`、`!foo`
-- **frecency 评分**：基于访问衰减 + 修改时间 + 历史选择（combo boost）
-- **行内 grep**：`fg --grep "TODO"` 对命中文件做行内匹配
-- **持久化 frecency/combo**：通过 `kv` 抽象（bbolt）记录用户选择历史
+- **模糊文件搜索**：`fg "type:go main util"` 按文件名 + 相对路径排序返回候选文件
+- **内容 grep**：`fg --grep "TODO"` 在扫描出的文件集中做逐行匹配
+- **搜索 + grep 组合**：`fg "type:go main" --grep "TODO"` 先筛文件，再只在命中文件内 grep
+- **约束语法**：支持 `type:go`、`*.go`、`size:>1KB`、`modified:7d`、`/src/`、`**/*.go`、`!vendor`
+- **确定性候选语义**：candidate index 可证明“无模糊命中”时直接返回空结果，不再退化为全量扫描结果
+- **仓库感知扫描**：固定跳过 `.git`、`.svn`、`.hg`、`.idea`、`node_modules`，并读取 root-level `.gitignore` / `.ignore`
+- **上下文感知库 API**：支持 `Open` / `SearchContext` / `Refresh` / `Close`，可复用运行时索引并传递取消/超时
+- **取消安全与原子刷新**：`Refresh` 与 `ScanContext` 失败或取消时保留旧快照，不破坏在线索引
+- **frecency + combo boost**：结合访问历史、修改时间和 query/path 组合选择记录排序
 
 ## 目录结构
 
@@ -34,18 +37,81 @@
 # 构建
 go build -o fg ./cmd/fg
 
+# 查看帮助
+./fg --help
+
 # 搜索：当前目录下 .go 文件中含 "main"
 ./fg "type:go main"
 
 # 搜索 + 显示分数
 ./fg --score "type:go main"
 
-# 行内内容 grep
+# 在全部扫描文件中做 grep
 ./fg --grep "TODO"
+
+# 先筛出 Go 文件，再只在结果内 grep
+./fg "type:go main" --grep "TODO"
 
 # 在指定目录
 ./fg -r ./pkg "modified:1d"
 ```
+
+## CLI 使用说明
+
+### 用法
+
+```text
+fg [flags] [query]
+```
+
+### 三种运行模式
+
+1. **模糊文件搜索**
+
+   ```bash
+   fg "type:go main"
+   ```
+
+2. **文件内容 grep**
+
+   ```bash
+   fg --grep "TODO"
+   ```
+
+3. **模糊搜索 + grep**
+
+   ```bash
+   fg "type:go main" --grep "TODO"
+   ```
+
+### Flags
+
+| Flag | 说明 |
+|---|---|
+| `-r`, `--root` | 指定搜索根目录，默认当前目录 |
+| `--limit` | 最多返回多少条结果，默认 `20` |
+| `--score` | 在文件搜索结果前打印 score |
+| `--grep` | 对文件内容做逐行匹配 |
+| `-h`, `--help` | 输出帮助信息 |
+
+### 查询语法
+
+| 语法 | 含义 | 示例 |
+|---|---|---|
+| `type:go` | 按语言/扩展族过滤 | `fg "type:go main"` |
+| `*.go` | 扩展 glob | `fg "*.go"` |
+| `size:>1KB` | 文件大小比较 | `fg "type:go size:>1KB"` |
+| `modified:7d` | 最近修改时间窗口 | `fg "modified:7d"` |
+| `/src/` | 路径段过滤 | `fg "/src/ type:go"` |
+| `**/*.go` | 路径 glob | `fg "**/*.go"` |
+| `!vendor` | 否定条件 | `fg "type:go !vendor"` |
+
+### Ignore 行为
+
+- 始终跳过：`.git`、`.svn`、`.hg`、`.idea`、`node_modules`
+- 读取根目录 `.gitignore` 与 `.ignore`
+- grep 无 file query 时，同样遵守上述 ignore 规则
+- 若 bigram candidate index 明确判断无匹配，`fg` 返回空结果，而不是退回到全量文件
 
 作为库使用：
 
@@ -54,23 +120,56 @@ import "github.com/superops-team/fg"
 
 results, err := fg.Search(".", "type:go main", 20)
 for _, r := range results {
-    fmt.Printf("%d  %s\n", r.Score(), r.Path())
+    fmt.Printf("%d  %s\n", r.Score, r.Path)
+}
+
+idx, err := fg.Open(context.Background(), fg.Options{Root: "."})
+if err != nil {
+    return err
+}
+defer idx.Close()
+results, err = idx.SearchContext(context.Background(), "type:go size:>1KB", 20)
+if err != nil {
+    return err
+}
+
+// 文件变化后刷新运行时索引；取消/失败不会破坏旧快照
+if err := idx.Refresh(context.Background()); err != nil {
+    return err
 }
 ```
 
+### 顶层库 API
+
+| API | 说明 |
+|---|---|
+| `fg.Search(root, query, limit)` | 一次性打开、搜索、关闭 |
+| `fg.SearchWith(opts)` | 基于 `fg.Options` 的一次性调用 |
+| `fg.Open(ctx, opts)` | 打开可复用索引 |
+| `(*Index).SearchContext(ctx, query, limit)` | 带 `context` 的查询 |
+| `(*Index).Refresh(ctx)` | 原子刷新快照 |
+| `(*Index).Close()` | 幂等关闭 |
+
 ## 测试与覆盖率
 
-所有单元测试 + 压力测试（高并发 / 大文件 / 多轮 race 检测）全部绿色。
+当前开发能力已由单元测试、race 检测与基准测试覆盖验证，包括：
+
+- CLI 帮助输出与组合模式
+- root-level ignore / bare directory ignore
+- candidate index no-match 语义
+- `Open` / `SearchContext` / `Refresh` / `Close` 生命周期
+- grep 在取消/超时时不返回 partial results
+- 索引刷新在取消时保留旧快照
 
 ```bash
 # 基础运行
 go test ./...
 
-# race + 3 轮（推荐）
-go test -race -count=3 ./...
+# race 检测
+go test -race ./...
 
-# 基准测试
-go test -bench=. -benchmem -run=^$ ./bigram ./grep ./picker
+# 关键基准测试
+go test -run=^$ -bench 'BenchmarkPicker_(ColdBuild_10k|WarmSearch_10k)|BenchmarkGrep_(MultiFileConcurrency|LargeFile)' ./picker ./grep
 
 # 一键压力（见 scripts/pressure.sh）
 bash scripts/pressure.sh
@@ -92,14 +191,17 @@ bash scripts/pressure.sh
 
 详细按函数覆盖率：[reports/coverage_func.txt](reports/coverage_func.txt)。
 
-### 基准测试摘要（Intel Xeon 8582C，GOMAXPROCS=2）
+### 基准测试摘要
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---|---|---|
 | `BenchmarkBigram_Build-2` | 2,926,377 | 4,143,508 | 1,614 |
 | `BenchmarkBigram_Candidates-2` | 992,066 | 41,120 | 4 |
-| `BenchmarkGrep_Search-2` | 5,218,101 | 491,398 | 1,173 |
-| `BenchmarkPicker_Scan-2` | 915,350 | 262,520 | 10,009 |
+| `BenchmarkGrep_MultiFileConcurrency-*` | 多文件 grep 并发路径 |
+| `BenchmarkGrep_LargeFile-*` | 单个大文件 grep 路径 |
+| `BenchmarkPicker_ColdBuild_10k-*` | 10k corpus 冷构建：scan + metadata + path arena + bigram |
+| `BenchmarkPicker_WarmSearch_10k-*` | 10k corpus 已构建索引上的重复搜索 |
+| `BenchmarkPicker_ColdBuild_100k-*` | 100k corpus 扩展冷构建基线 |
 
 完整输出：[reports/bench.txt](reports/bench.txt)
 
@@ -115,7 +217,7 @@ bash scripts/pressure.sh
 
 1. `DESIGN_SPEC.md`：架构与各包的类型/算法规格
 2. `TESTING_AND_SCHEDULE.md`：分层任务拆解、测试目标与时间规划
-3. 按 TDD 先写测试 → 实现 → `go vet`/`go test -race -count=3` 三轮稳定 → 提交
+3. 按 TDD 先写测试 → 实现 → `go test ./...` + `go test -race ./...` 稳定后提交
 4. 每次 PR 之前运行 `bash scripts/pressure.sh` 做压力测试
 
 ## License

@@ -212,6 +212,8 @@ func TestParse_SizeCmp(t *testing.T) {
 		{"=1B", SizeEq, 1},
 		{">=100B", SizeGte, 100},
 		{"<=5MB", SizeLte, 5 * 1024 * 1024},
+		{"size:>1KB", SizeGt, 1024},
+		{"size:<100B", SizeLt, 100},
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
@@ -338,9 +340,9 @@ func TestParseDurationAgo_Invalid(t *testing.T) {
 
 func TestExtensionFor(t *testing.T) {
 	tests := []struct {
-		in     string
-		exts   []string
-		isNil  bool
+		in    string
+		exts  []string
+		isNil bool
 	}{
 		{"go", []string{".go"}, false},
 		{"Go", []string{".go"}, false}, // 大小写不敏感

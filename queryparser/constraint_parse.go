@@ -55,6 +55,8 @@ func parseConstraintToken(token string) *Constraint {
 			return &Constraint{Kind: CGitStatus, Value: strings.ToLower(val)}
 		case "type":
 			return &Constraint{Kind: CFileType, Value: strings.ToLower(val)}
+		case "size":
+			return parseSizeConstraint(val)
 		case "modified":
 			// modified:7d / modified:24h
 			return &Constraint{Kind: CModifiedAgo, Value: val}
@@ -62,39 +64,49 @@ func parseConstraintToken(token string) *Constraint {
 	}
 
 	// SizeCmp: >1MB / <10KB / =1KB / >=100B / <=5MB
-	if len(token) >= 2 {
-		op, rest := "", token
-		switch {
-		case strings.HasPrefix(token, ">="):
-			op, rest = ">=", token[2:]
-		case strings.HasPrefix(token, "<="):
-			op, rest = "<=", token[2:]
-		case strings.HasPrefix(token, ">"):
-			op, rest = ">", token[1:]
-		case strings.HasPrefix(token, "<"):
-			op, rest = "<", token[1:]
-		case strings.HasPrefix(token, "="):
-			op, rest = "=", token[1:]
-		}
-		if op != "" {
-			if n, ok := ParseHumanSize(rest); ok {
-				var op_ SizeOp
-				switch op {
-				case ">":
-					op_ = SizeGt
-				case "<":
-					op_ = SizeLt
-				case ">=":
-					op_ = SizeGte
-				case "<=":
-					op_ = SizeLte
-				case "=":
-					op_ = SizeEq
-				}
-				return &Constraint{Kind: CSizeCmp, SizeOp: op_, SizeBytes: n, Value: rest}
-			}
-		}
+	if c := parseSizeConstraint(token); c != nil {
+		return c
 	}
 
 	return nil
+}
+
+func parseSizeConstraint(token string) *Constraint {
+	if len(token) < 2 {
+		return nil
+	}
+	op, rest := "", token
+	switch {
+	case strings.HasPrefix(token, ">="):
+		op, rest = ">=", token[2:]
+	case strings.HasPrefix(token, "<="):
+		op, rest = "<=", token[2:]
+	case strings.HasPrefix(token, ">"):
+		op, rest = ">", token[1:]
+	case strings.HasPrefix(token, "<"):
+		op, rest = "<", token[1:]
+	case strings.HasPrefix(token, "="):
+		op, rest = "=", token[1:]
+	}
+	if op == "" {
+		return nil
+	}
+	n, ok := ParseHumanSize(rest)
+	if !ok {
+		return nil
+	}
+	var sizeOp SizeOp
+	switch op {
+	case ">":
+		sizeOp = SizeGt
+	case "<":
+		sizeOp = SizeLt
+	case ">=":
+		sizeOp = SizeGte
+	case "<=":
+		sizeOp = SizeLte
+	case "=":
+		sizeOp = SizeEq
+	}
+	return &Constraint{Kind: CSizeCmp, SizeOp: sizeOp, SizeBytes: n, Value: rest}
 }

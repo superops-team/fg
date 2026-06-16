@@ -3,6 +3,7 @@ package picker
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,6 +52,10 @@ type Picker struct {
 	scanned atomic.Bool // Scan 完成标志
 
 	pagePool *core.PagePool
+}
+
+type rootIgnoreRules struct {
+	patterns []string
 }
 
 // Result 表示单条搜索结果
@@ -142,16 +147,25 @@ func (p *Picker) TouchByIndex(i int) {
 
 // Scan 扫描 root 目录，构建文件索引
 func (p *Picker) Scan() error {
-	// 重置状态
-	p.arena = core.NewPathArena(4096)
-	p.fileMu.Lock()
-	p.files = p.files[:0]
-	p.fileMu.Unlock()
+	return p.ScanContext(context.Background())
+}
+
+func (p *Picker) ScanContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ignoreRules := loadRootIgnoreRules(p.root)
+	newArena := core.NewPathArena(4096)
+	newFiles := make([]core.FileItem, 0, 4096)
+	newBg := bigram.NewBigram()
 
 	// 收集相对路径
 	var relPaths []string
 
 	err := filepath.WalkDir(p.root, func(full string, d os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -159,17 +173,21 @@ func (p *Picker) Scan() error {
 		if relErr != nil {
 			rel = full
 		}
-		// 忽略隐藏目录（.git, .svn, .hg）
+		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
 			name := d.Name()
-			if name != "." && strings.HasPrefix(name, ".") {
-				if name == ".git" || name == ".svn" || name == ".hg" || name == ".idea" || name == "node_modules" {
-					return filepath.SkipDir
-				}
+			if name == ".git" || name == ".svn" || name == ".hg" || name == ".idea" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			if rel != "." && ignoreRules.matchDir(rel) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
 		if !d.Type().IsRegular() {
+			return nil
+		}
+		if ignoreRules.matchFile(rel) {
 			return nil
 		}
 		if p.opts.IgnoreFn != nil && p.opts.IgnoreFn(rel) {
@@ -198,8 +216,7 @@ func (p *Picker) Scan() error {
 		}
 
 		// 创建 FileItem
-		p.fileMu.Lock()
-		cp := p.arena.Intern(rel)
+		cp := newArena.Intern(rel)
 		fi := core.FileItem{
 			Size:                      uint64(size),
 			Modified:                  uint64(info.ModTime().Unix()),
@@ -215,23 +232,112 @@ func (p *Picker) Scan() error {
 		}
 		// 根据 modified 计算 mod frecency
 		fi.ModificationFrecencyScore = p.frec.GetModificationScore(int64(fi.Modified), false)
-		p.files = append(p.files, fi)
-		relPaths = append(relPaths, p.arena.Get(cp)) // 相对路径
-		p.fileMu.Unlock()
+		newFiles = append(newFiles, fi)
+		relPaths = append(relPaths, newArena.Get(cp)) // 相对路径
 
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// 构建 bigram 索引
 	if len(relPaths) > 0 {
-		p.bg.Build(relPaths)
+		newBg.Build(relPaths)
 	}
 
+	p.fileMu.Lock()
+	p.arena = newArena
+	p.files = newFiles
+	p.bg = newBg
+	p.fileMu.Unlock()
 	p.scanned.Store(true)
 	return nil
+}
+
+func loadRootIgnoreRules(root string) rootIgnoreRules {
+	var rules rootIgnoreRules
+	for _, name := range []string{".gitignore", ".ignore"} {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			pattern := strings.TrimSpace(line)
+			if pattern == "" || strings.HasPrefix(pattern, "#") || strings.HasPrefix(pattern, "!") {
+				continue
+			}
+			rules.patterns = append(rules.patterns, filepath.ToSlash(pattern))
+		}
+	}
+	return rules
+}
+
+func (r rootIgnoreRules) matchDir(rel string) bool {
+	rel = strings.Trim(filepath.ToSlash(rel), "/")
+	base := filepath.Base(rel)
+	for _, pattern := range r.patterns {
+		pattern = strings.Trim(filepath.ToSlash(strings.TrimSpace(pattern)), "/")
+		if pattern == "" {
+			continue
+		}
+		if strings.Contains(pattern, "/") {
+			if ok, err := filepath.Match(pattern, rel); err == nil && ok {
+				return true
+			}
+			continue
+		}
+		if ok, err := filepath.Match(pattern, base); err == nil && ok {
+			return true
+		}
+		if pattern == base {
+			return true
+		}
+		if strings.HasSuffix(pattern, "/") {
+			dir := strings.Trim(pattern, "/")
+			if rel == dir || strings.HasPrefix(rel, dir+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r rootIgnoreRules) matchFile(rel string) bool {
+	rel = strings.Trim(filepath.ToSlash(rel), "/")
+	base := filepath.Base(rel)
+	for _, pattern := range r.patterns {
+		pattern = strings.TrimSpace(filepath.ToSlash(pattern))
+		if pattern == "" {
+			continue
+		}
+		if strings.HasSuffix(pattern, "/") {
+			dir := strings.Trim(pattern, "/")
+			if rel == dir || strings.HasPrefix(rel, dir+"/") {
+				return true
+			}
+			continue
+		}
+		pattern = strings.Trim(pattern, "/")
+		if strings.Contains(pattern, "/") {
+			ok, err := filepath.Match(pattern, rel)
+			if err == nil && ok {
+				return true
+			}
+			continue
+		}
+		ok, err := filepath.Match(pattern, base)
+		if err == nil && ok {
+			return true
+		}
+		if pattern == base {
+			return true
+		}
+	}
+	return false
 }
 
 // ================================================================
@@ -258,15 +364,25 @@ type scoredResult struct {
 
 // Search 返回 top-N 结果。query 支持 "hello type:go size:>10KB modified:7d" 格式。
 func (p *Picker) Search(query string, limit int) ([]Result, error) {
+	return p.SearchContext(context.Background(), query, limit)
+}
+
+func (p *Picker) SearchContext(ctx context.Context, query string, limit int) ([]Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return nil, nil
 	}
-	if err := p.ensureScanned(); err != nil {
+	if err := p.ensureScannedContext(ctx); err != nil {
 		return nil, err
 	}
 
-	plan, err := p.prepareSearch(query)
+	plan, err := p.prepareSearchContext(ctx, query)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -278,23 +394,40 @@ func (p *Picker) Search(query string, limit int) ([]Result, error) {
 	}
 
 	candidates := p.searchCandidates(plan.fuzzyText, n)
-	scoredBuf := p.scoreCandidates(candidates, plan)
+	scoredBuf, err := p.scoreCandidatesContext(ctx, candidates, plan)
+	if err != nil {
+		return nil, err
+	}
 	scoredBuf = append(scoredBuf, p.scoreDeletedGitCandidates(plan)...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	p.sortScored(scoredBuf)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return p.resultsFromScored(scoredBuf, limit), nil
 }
 
 func (p *Picker) ensureScanned() error {
+	return p.ensureScannedContext(context.Background())
+}
+
+func (p *Picker) ensureScannedContext(ctx context.Context) error {
 	if p.scanned.Load() {
 		return nil
 	}
-	return p.Scan()
+	return p.ScanContext(ctx)
 }
 
 func (p *Picker) prepareSearch(query string) (searchPlan, error) {
+	return p.prepareSearchContext(context.Background(), query)
+}
+
+func (p *Picker) prepareSearchContext(ctx context.Context, query string) (searchPlan, error) {
 	parsed := queryparser.New().Parse(query)
 	fuzzyText := normalizeFuzzy(parsed.Fuzzy)
-	gitStatuses, err := p.gitStatusesForQuery(parsed.Constraints)
+	gitStatuses, err := p.gitStatusesForQueryContext(ctx, parsed.Constraints)
 	if err != nil {
 		return searchPlan{}, err
 	}
@@ -313,18 +446,51 @@ func (p *Picker) searchCandidates(fuzzyText string, n int) []uint32 {
 	if fuzzyText == "" {
 		return makeRange(n)
 	}
-	main := p.bg.Candidates(fuzzyText)
-	extra := p.overlay.Candidates(fuzzyText)
-	if len(main) == 0 && len(extra) == 0 {
+	main := p.bg.CandidateOutcome(fuzzyText)
+	extra := p.overlay.CandidateOutcome(fuzzyText)
+	if main.State == bigram.CandidatesUnavailable && extra.State == bigram.CandidatesUnavailable {
 		return makeRange(n)
 	}
-	return append(main, extra...)
+	if main.State != bigram.CandidatesFound && extra.State != bigram.CandidatesFound {
+		return []uint32{}
+	}
+	return dedupeCandidates(main.Candidates, extra.Candidates)
+}
+
+func dedupeCandidates(a, b []uint32) []uint32 {
+	out := make([]uint32, 0, len(a)+len(b))
+	seen := make(map[uint32]struct{}, len(a)+len(b))
+	for _, idx := range a {
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		out = append(out, idx)
+	}
+	for _, idx := range b {
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		out = append(out, idx)
+	}
+	return out
 }
 
 func (p *Picker) scoreCandidates(candidates []uint32, plan searchPlan) []scoredResult {
+	scored, _ := p.scoreCandidatesContext(context.Background(), candidates, plan)
+	return scored
+}
+
+func (p *Picker) scoreCandidatesContext(ctx context.Context, candidates []uint32, plan searchPlan) ([]scoredResult, error) {
 	n := len(p.files)
 	scoredBuf := make([]scoredResult, 0, len(candidates))
-	for _, idx := range candidates {
+	for i, idx := range candidates {
+		if i&127 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if int(idx) >= n {
 			continue
 		}
@@ -354,7 +520,10 @@ func (p *Picker) scoreCandidates(candidates []uint32, plan searchPlan) []scoredR
 			modified: f.Modified,
 		})
 	}
-	return scoredBuf
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return scoredBuf, nil
 }
 
 func scoreFuzzyPath(relPath string, plan searchPlan, binary bool) int32 {
@@ -708,10 +877,14 @@ func matchGlobSegments(patternParts, pathParts []string) bool {
 }
 
 func (p *Picker) gitStatusesForQuery(constraints []queryparser.Constraint) (map[string]core.GitStatusKind, error) {
+	return p.gitStatusesForQueryContext(context.Background(), constraints)
+}
+
+func (p *Picker) gitStatusesForQueryContext(ctx context.Context, constraints []queryparser.Constraint) (map[string]core.GitStatusKind, error) {
 	if !hasGitStatusConstraint(constraints) {
 		return nil, nil
 	}
-	statuses, err := loadGitStatuses(p.root)
+	statuses, err := loadGitStatusesContext(ctx, p.root)
 	if err != nil {
 		return nil, fmt.Errorf("load git status: %w", err)
 	}
@@ -740,9 +913,19 @@ func isKnownGitStatusValue(value string) bool {
 }
 
 func loadGitStatuses(root string) (map[string]core.GitStatusKind, error) {
-	cmd := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	return loadGitStatusesContext(context.Background(), root)
+}
+
+func loadGitStatusesContext(ctx context.Context, root string) (map[string]core.GitStatusKind, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("git status --porcelain failed in %q: %w: %s", root, err, strings.TrimSpace(string(out)))
 	}
 	statuses := make(map[string]core.GitStatusKind)

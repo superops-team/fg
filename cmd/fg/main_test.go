@@ -35,8 +35,18 @@ func TestCLI_Help(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code=%d stderr=%q", code, stderr)
 	}
-	if !strings.Contains(stdout, "Usage:") {
-		t.Fatalf("help should contain Usage, got %q", stdout)
+	for _, want := range []string{
+		"Usage:",
+		"Modes:",
+		"fg [flags] \"type:go main\"",
+		"fg [flags] \"type:go main\" --grep \"TODO\"",
+		"Query constraints:",
+		"Root ignore:",
+		"Library API:",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("help should contain %q, got %q", want, stdout)
+		}
 	}
 }
 
@@ -76,6 +86,25 @@ func TestCLI_Grep(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "note.txt") || !strings.Contains(stdout, "TODO item") {
 		t.Fatalf("grep output should contain file and matching line, got %q", stdout)
+	}
+}
+
+func TestCLI_GrepHonorsRootIgnoreWithoutFileQuery(t *testing.T) {
+	root := t.TempDir()
+	writeCLITestFile(t, root, ".gitignore", "ignored.log\nbuild\n")
+	writeCLITestFile(t, root, "keep.txt", "TODO keep\n")
+	writeCLITestFile(t, root, "ignored.log", "TODO ignored\n")
+	writeCLITestFile(t, root, "build/generated.txt", "TODO generated\n")
+
+	stdout, stderr, code := runCLIForTest("-r", root, "--grep", "TODO")
+	if code != 0 {
+		t.Fatalf("exit code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, "keep.txt") {
+		t.Fatalf("grep output should contain keep.txt, got %q", stdout)
+	}
+	if strings.Contains(stdout, "ignored.log") || strings.Contains(stdout, "generated.txt") {
+		t.Fatalf("grep should honor root ignore rules, got %q", stdout)
 	}
 }
 

@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// BenchmarkGrep_Search 衡量并发 grep 100 个文件
-func BenchmarkGrep_Search(b *testing.B) {
+// BenchmarkGrep_MultiFileConcurrency 衡量多文件并发 grep 路径。
+func BenchmarkGrep_MultiFileConcurrency(b *testing.B) {
 	dir := b.TempDir()
 	for i := 0; i < 100; i++ {
 		name := filepath.Join(dir, "file_"+strconv.Itoa(i)+".go")
@@ -32,6 +32,26 @@ func BenchmarkGrep_Search(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = m.SearchMany(paths, "TODO", 5)
+	}
+}
+
+// BenchmarkGrep_LargeFile 衡量单个大文件 grep 路径。
+func BenchmarkGrep_LargeFile(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "large.log")
+	chunk := "lorem ipsum dolor sit amet\n"
+	content := make([]byte, 0, 2*1024*1024)
+	for len(content) < 2*1024*1024 {
+		content = append(content, chunk...)
+	}
+	content = append(content, "needle appears here\n"...)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		b.Fatal(err)
+	}
+	m := New(Options{MaxBytes: 3 * 1024 * 1024})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = m.SearchFile(path, "needle", 5)
 	}
 }
 

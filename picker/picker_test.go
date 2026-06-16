@@ -1,9 +1,11 @@
 package picker
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,6 +121,45 @@ func TestPicker_SearchWithBigram(t *testing.T) {
 	_ = containsUtil
 }
 
+func TestPicker_CandidateNoMatchDoesNotFallbackToAllFiles(t *testing.T) {
+	root := setupFixture(t)
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	p.TouchByIndex(0)
+
+	results, err := p.Search("zzzz-not-present", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		paths := make([]string, len(results))
+		for i, r := range results {
+			paths[i] = r.Path()
+		}
+		t.Fatalf("usable bigram no-match must not fall back to all files, got %d: %s", len(results), strings.Join(paths, ", "))
+	}
+}
+
+func TestPicker_CandidateUnavailableFallsBackToAllFiles(t *testing.T) {
+	root := setupFixture(t)
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := p.Search("m", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("single-character fuzzy query has no usable bigram and should fall back to scanned files")
+	}
+}
+
 // ================================================================
 // 4. frecency: Touch 之后评分上升
 // ================================================================
@@ -232,6 +273,147 @@ func TestPicker_SearchExcludesBinaryByContent(t *testing.T) {
 	// 注：是否把 binary 从搜索结果中剔除由实现决定；本测试仅验证 flag 正确
 }
 
+func TestPicker_ScanHonorsRootLevelIgnoreFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("ignored.log\nbuild/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ignore"), []byte("*.tmp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"keep.go":            "package keep\n",
+		"ignored.log":        "ignored\n",
+		"scratch.tmp":        "ignored\n",
+		"build/generated.go": "package generated\n",
+	}
+	for rel, content := range files {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	results, err := p.Search("type:go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || filepath.Base(results[0].Path()) != "keep.go" {
+		t.Fatalf("root ignore files should exclude ignored paths and keep non-ignored file, got %+v", results)
+	}
+	for i := 0; i < p.FileCount(); i++ {
+		rel, err := filepath.Rel(root, p.PathAt(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rel == "ignored.log" || rel == "scratch.tmp" || rel == filepath.Join("build", "generated.go") {
+			t.Fatalf("ignored path %q should not be indexed", rel)
+		}
+	}
+}
+
+func TestPicker_ScanHonorsBareDirectoryIgnoreRule(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"keep.go":            "package keep\n",
+		"build/generated.go": "package generated\n",
+	}
+	for rel, content := range files {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	results, err := p.Search("type:go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || filepath.Base(results[0].Path()) != "keep.go" {
+		t.Fatalf("bare directory ignore rule should exclude build/generated.go, got %+v", results)
+	}
+}
+
+func TestPicker_CanceledRescanPreservesPreviousSnapshot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "old.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "new.go"), []byte("package new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.ScanContext(ctx); err == nil {
+		t.Fatal("canceled ScanContext should return error")
+	}
+	results, err := p.Search("type:go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || filepath.Base(results[0].Path()) != "old.go" {
+		t.Fatalf("canceled rescan should preserve previous snapshot, got %+v", results)
+	}
+}
+
+func TestPicker_ScanPreservesHardcodedSkipDirectories(t *testing.T) {
+	root := t.TempDir()
+	paths := []string{
+		"keep.go",
+		filepath.Join("node_modules", "dep.go"),
+		filepath.Join(".git", "config"),
+		filepath.Join(".idea", "workspace.xml"),
+	}
+	for _, rel := range paths {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("package main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := New(root, Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < p.FileCount(); i++ {
+		rel, err := filepath.Rel(root, p.PathAt(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(filepath.ToSlash(rel), "node_modules/") || strings.HasPrefix(filepath.ToSlash(rel), ".git/") || strings.HasPrefix(filepath.ToSlash(rel), ".idea/") {
+			t.Fatalf("hardcoded skipped directory path %q should not be indexed", rel)
+		}
+	}
+}
+
 // ================================================================
 // 8. 结果按 Score 降序
 // ================================================================
@@ -253,6 +435,48 @@ func TestPicker_ResultsSortedByScoreDesc(t *testing.T) {
 	if !sort.SliceIsSorted(scores, func(i, j int) bool { return scores[i] > scores[j] }) &&
 		!sort.SliceIsSorted(scores, func(i, j int) bool { return scores[i] >= scores[j] }) {
 		t.Fatalf("结果未按 score 降序: %v", scores)
+	}
+}
+
+func TestPicker_ResultOrderingBreaksTiesByModifiedThenPath(t *testing.T) {
+	root := t.TempDir()
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	files := []struct {
+		rel string
+		mod time.Time
+	}{
+		{rel: "b.go", mod: older},
+		{rel: "a.go", mod: older},
+		{rel: "z.go", mod: newer},
+	}
+	for _, file := range files {
+		path := filepath.Join(root, file.rel)
+		if err := os.WriteFile(path, []byte("package main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, file.mod, file.mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := New(root, Options{NowFunc: func() time.Time { return newer.Add(24 * time.Hour) }})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	results, err := p.Search("type:go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected three results, got %d", len(results))
+	}
+	want := []string{"z.go", "a.go", "b.go"}
+	for i, wantBase := range want {
+		if got := filepath.Base(results[i].Path()); got != wantBase {
+			t.Fatalf("result %d = %s, want %s", i, got, wantBase)
+		}
 	}
 }
 
@@ -316,8 +540,8 @@ func TestPicker_ModifiedAgo_UsesInjectedClock(t *testing.T) {
 		name    string
 		modTime time.Time
 	}{
-		{"old.txt", now.AddDate(-1, 0, 0)},   // 1 年前
-		{"recent.txt", now.AddDate(0, 0, -3)}, // 3 天前
+		{"old.txt", now.AddDate(-1, 0, 0)},     // 1 年前
+		{"recent.txt", now.AddDate(0, 0, -3)},  // 3 天前
 		{"fresh.txt", now.Add(-1 * time.Hour)}, // 1 小时前
 	}
 	for _, f := range files {

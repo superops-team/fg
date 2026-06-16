@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	fg "github.com/superops-team/fg"
 	"github.com/superops-team/fg/grep"
+	"github.com/superops-team/fg/picker"
 )
 
 const defaultLimit = 20
@@ -189,29 +189,42 @@ func grepTargets(root, fileQuery string, limit int) ([]string, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
-	paths := make([]string, 0, limit)
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == ".svn" || name == ".hg" || name == ".idea" || name == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		paths = append(paths, path)
-		return nil
-	})
-	return paths, err
+	p := picker.New(root, picker.Options{})
+	defer p.Close()
+	if err := p.Scan(); err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, p.FileCount())
+	for i := 0; i < p.FileCount(); i++ {
+		paths = append(paths, p.PathAt(i))
+	}
+	return paths, nil
 }
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage: fg [flags] [query]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Modes:")
+	fmt.Fprintln(w, "  1) Fuzzy file search")
+	fmt.Fprintln(w, "     fg [flags] \"type:go main\"")
+	fmt.Fprintln(w, "  2) Grep inside matched files")
+	fmt.Fprintln(w, "     fg [flags] --grep \"TODO\"")
+	fmt.Fprintln(w, "  3) Fuzzy file search + grep in the filtered subset")
+	fmt.Fprintln(w, "     fg [flags] \"type:go main\" --grep \"TODO\"")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Query constraints:")
+	fmt.Fprintln(w, "  type:go           language / extension family filter")
+	fmt.Fprintln(w, "  *.go              extension glob")
+	fmt.Fprintln(w, "  size:>1KB         size compare (> >= < <= =)")
+	fmt.Fprintln(w, "  modified:7d       modified within duration window")
+	fmt.Fprintln(w, "  /src/             path segment match")
+	fmt.Fprintln(w, "  **/*.go           glob path match")
+	fmt.Fprintln(w, "  !vendor           negation")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Root ignore:")
+	fmt.Fprintln(w, "  - Always skips .git, .svn, .hg, .idea, node_modules")
+	fmt.Fprintln(w, "  - Reads root-level .gitignore and .ignore")
+	fmt.Fprintln(w, "  - When the candidate index can prove no fuzzy match, fg returns no results instead of falling back to all files")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  -r, --root string   search root (default \".\")")
@@ -219,4 +232,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      --score         print score with each path")
 	fmt.Fprintln(w, "      --grep string   search file contents")
 	fmt.Fprintln(w, "  -h, --help          show help")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Library API:")
+	fmt.Fprintln(w, "  - fg.Search(root, query, limit)")
+	fmt.Fprintln(w, "  - fg.Open(ctx, fg.Options{Root: root}) + SearchContext / Refresh / Close")
 }

@@ -8,6 +8,7 @@ package grep
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -79,6 +80,13 @@ func New(opts Options) *GrepMatcher {
 
 // SearchFile 在单文件内匹配 query。返回命中行（最多 limit 行。
 func (g *GrepMatcher) SearchFile(path, query string, limit int) ([]LineResult, error) {
+	return g.SearchFileContext(context.Background(), path, query, limit)
+}
+
+func (g *GrepMatcher) SearchFileContext(ctx context.Context, path, query string, limit int) ([]LineResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if query == "" || limit <= 0 {
 		return nil, nil
 	}
@@ -117,17 +125,27 @@ func (g *GrepMatcher) SearchFile(path, query string, limit int) ([]LineResult, e
 	}
 
 	results := make([]LineResult, 0, 8)
-	if err := g.searchReaderLines(f, tokens, caseInsensitive, limit, &results); err != nil {
+	if err := g.searchReaderLinesContext(ctx, f, tokens, caseInsensitive, limit, &results); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return results, err
 	}
 	return results, nil
 }
 
 func (g *GrepMatcher) searchReaderLines(r io.Reader, tokens []string, caseInsensitive bool, limit int, results *[]LineResult) error {
+	return g.searchReaderLinesContext(context.Background(), r, tokens, caseInsensitive, limit, results)
+}
+
+func (g *GrepMatcher) searchReaderLinesContext(ctx context.Context, r io.Reader, tokens []string, caseInsensitive bool, limit int, results *[]LineResult) error {
 	reader := bufio.NewReader(r)
 	totalRead := 0
 	lineno := 0
 	for len(*results) < limit && totalRead < g.opts.MaxBytes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		line, readAny, err := readLinePrefix(reader, g.opts.MaxBytes-totalRead)
 		if err != nil {
 			return err
@@ -239,6 +257,13 @@ func findFirstMatch(line, tok string, caseInsensitive bool) MatchRange {
 
 // SearchMany 并发在多个文件里搜索，返回每个文件的结果（空结果不返回）。
 func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int) ([]FileResult, error) {
+	return g.SearchManyContext(context.Background(), paths, query, limitPerFile)
+}
+
+func (g *GrepMatcher) SearchManyContext(ctx context.Context, paths []string, query string, limitPerFile int) ([]FileResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if query == "" || limitPerFile <= 0 || len(paths) == 0 {
 		return nil, nil
 	}
@@ -249,12 +274,20 @@ func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int)
 	errsCh := make(chan indexedError, len(paths))
 
 	for i, p := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		wg.Add(1)
 		go func(idx int, path string) {
 			defer wg.Done()
-			sem <- struct{}{}        // acquire
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errsCh <- indexedError{idx: idx, err: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }() // release
-			lines, err := g.SearchFile(path, query, limitPerFile)
+			lines, err := g.SearchFileContext(ctx, path, query, limitPerFile)
 			if err != nil {
 				errsCh <- indexedError{idx: idx, err: fmt.Errorf("%s: %w", path, err)}
 				return
@@ -287,7 +320,14 @@ func (g *GrepMatcher) SearchMany(paths []string, query string, limitPerFile int)
 	for _, indexedErr := range indexedErrs {
 		errs = append(errs, indexedErr.err)
 	}
-	return out, errors.Join(errs...)
+	joinedErr := errors.Join(errs...)
+	if errors.Is(joinedErr, context.Canceled) || errors.Is(joinedErr, context.DeadlineExceeded) {
+		return nil, joinedErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return out, joinedErr
 }
 
 // ================================================================
